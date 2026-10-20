@@ -1,0 +1,323 @@
+Neura v0.3.7 增量修复版
+
+评审有效。v0.3.6 的 expected_error_span 是人工数的，不是 parser 输出的。4 条列号错 + 1 条期望无法触发，这是「跑 parser」这一步被跳过。本版不重写全规范，只给增量修复；未列出的产生式、语义规则、章节与 v0.3.6 完全一致。
+
+修复原则：
+
+§17 的 expected_error_span 必须由 parser 实际输出填入，人工只审「错误码对不对、message 可读吗」。v0.3.7 是阶段 A（人工数 + 标注待验证）；parser 实现后进入阶段 B（parser 输出替换人工数）。
+
+本版修 5 个 P0、6 个 P1、2 个 P2，新增 1 条 checker 规则、1 个 CI 三阶段流程。
+
+---
+
+0. v0.3.7 修复决策表
+
+编号 问题 修复
+A-P0-1 N4 col=28 指向 where，不是 foo_bar 改 col=32（foo_bar 的 f）
+A-P0-2 N5 col=41 指向 consistent_hash 内部 改 col=48（nonexistent 的 n）
+A-P0-3 N9 col=25 指向 failover 末尾（注：col=25 实为 failover 的 r，非 e；评审细节小误，结论正确） 改 col=27（retry 的 r）
+A-P0-4 N10 col=48 指向 on_failure，且 SomeLogic.run 不是端口，checker 先报「无输出端口」 前置块加 neuron Src/Dst；N10 改为 synapse Src.o -> Dst.i on_failure failover；col=51（failover 的 f）
+A-P0-5 N12 的 fn bad_fn 局部 mut 赋值不是副作用，期望无法触发 N12 改用 learn(1) 触发日志副作用；规则 35 明确「learn 视为非纯」
+B-1 规则 14 重写 / 规则 37 新增，编号歧义 删规则 14，只留规则 37；§2.1 改为「规则 14 原语义并入规则 37」
+B-2 self.last\n= Some(e) 跨行赋值被 ;ᵥ 截断 §1.3 例外清单加「行首 = 抑制」
+B-3 ../..= 未在 §1.2 运算符表 §1.2 补 .. ..=，写明独立 token 不拆分
+B-4 Range 显式声明未定义 规则 36 补：Range 是 for 专用类型，不可显式声明
+B-5 内建类型名数量「19 或 20」 核对为 20 个（Int/Int32/Int64/Float/F32/F64/Bool/String/Unit/Bytes/Never/Duration/Size/Signal/Option/Result/Vec/Set/Map/Graph）
+B-6 局部 mut 赋值语义未定义 §12 加规则 39
+C-1 正例标注 expected: 通过 不精确 改为 expected: parse+check OK
+C-2 E-UNIT-OUTSIDE-PHYSICS span 定义不明 §3 规则 20 写明 span 为 [ - ] (int\|float) ident 的起始 token
+
+---
+
+1. 词法变更
+
+1.1 §1.2 运算符表补 .. / ..=（B-3）
+
+§1.2 运算符表追加：
+
+```text
++ - * / % == != < <= > >= && || ! ~= = -> => . , : ; ( ) { } [ ] < > .. ..=
+```
+
+写死：.. 和 ..= 是独立 token，不拆分。lexer 扫描到 . 后立即 lookahead 下一字符：若下一字符是 .，再 lookahead 是否为 =：..= 合为三字符 token，.. 合为两字符 token；否则 . 是单字符 token。.. 不参与 postfix_expr 的 . 字段访问。
+
+1.2 例外清单加「行首 = 抑制」（B-2）
+
+§1.3 例外清单从 4 条改为 5 条：
+
+```text
+1. 行首 ( [ { , 抑制。
+2. 行首二元运算符抑制：+ - * / % == != < <= > >= && || 。
+   注释：< 和 > 的抑制在 lexer 层生效；parser 在 type 位置分派给 generic，
+   在 expr 位置分派给比较运算符。
+3. 行首 . 抑制。
+4. 行首 = 抑制（新增）。
+   注释：赋值语句跨行时，行首 = 抑制前一行插入 ;ᵥ。
+   示例：self.last
+           = Some(e)     // 合法：解析为 self.last = Some(e)
+   副作用：let x = 1
+             = 2          // 抑制后解析为 let x = 1 = 2，parser 报
+                         // E-ASSIGN-LHS「= 左侧不能是字面量」，错误更准确。
+5. 注释行不触发。
+```
+
+---
+
+2. 语句与部署变更
+
+2.1 规则 14 删除，并入规则 37（B-1）
+
+§2.1 措辞改为：
+
+原规则 14 的「do block 禁止 emit」语义已并入规则 37。规则 37 覆盖三种上下文：do block、fn block 禁止 emit，emit 仅 neuron handler 合法。§12 清单中删除规则 14，编号从 15 起顺延（见 §3 规则重排）。
+
+§12 规则重排（v0.3.7）：原规则 14 删除，原规则 15–38 编号不变，新增规则 39。checker 清单从 38 条变为 38 条（删 14 加 39），编号有空洞但 CI 按错误码对拍不依赖编号。
+
+2.2 规则 36 补 Range 显式声明（B-4）
+
+§3 规则 36 追加：
+
+Range 是 for 专用类型。用户不能显式声明 Range 类型变量、不能作为 fn 参数/返回值、不能构造除 a..b / a..=b 之外的 Range。let r: Range = 0..10 报 E-RANGE-OUTSIDE-FOR。Range 仅作为 for 的 expr 类型出现。
+
+---
+
+3. Checker 规则变更
+
+3.1 规则 20 重写（C-2，span 定义）
+
+```text
+20. unit_lit 仅在 physics_value 位置合法；
+    expr 位置见 [ "-" ] (int_lit | float_lit) ident 模式 →
+    报 E-UNIT-OUTSIDE-PHYSICS，span 为 [ "-" ] (int|float) 的起始 token
+    （有 - 时指向 -，无 - 时指向数值）。
+    示例：let x = -55mV → span 指向 -（col 11）
+          let x =  55mV → span 指向 55（col 11）
+```
+
+3.2 规则 35 补副作用清单（A-P0-5、B-6）
+
+§3 规则 35 改为：
+
+where 表达式中的 fn 调用必须是纯函数。副作用包括：emit、外部调用（非白名单）、修改 self、修改全局状态、learn（日志副作用）。局部 mut 变量赋值不算副作用（对外不可见）。is_hazardous / hash_of 视为纯，learn 视为非纯。fn 内 emit 已被规则 37 禁止，learn 在 fn 内合法但使其非纯。
+
+3.3 规则 39 新增（B-6）
+
+§12 追加：
+
+```text
+39. fn 内的局部 mut 变量赋值不算副作用，函数可视为纯函数（用于规则 35）。
+    纯函数判定：无 emit、无外部调用（白名单外）、无 self 修改、无全局状态修改、
+    无 learn 调用。is_hazardous / hash_of 视为纯；learn 视为非纯。
+```
+
+---
+
+4. §17 重写（阶段 A：人工数 + 标注待验证）
+
+4.1 §17 开头新增流程声明
+
+§17 的 expected_error_span 分两阶段：
+
+· 阶段 A（v0.3.7 当前）：人工数 + 标注 [待 parser 验证]。CI 跑 parser，输出实际 span，与 expected 比对，不一致 → warn（不阻断），提示「§17 N 的列号需更新」。
+· 阶段 B（parser 实现后）：parser 输出实际 span → 人工确认正确 → 填入 §17 → CI 改为阻断模式。
+· 阶段 C（稳定后）：§17 由 parser --dump-errors 自动生成，人工只审 message。
+
+v0.3.7 的列号仍是人工数，parser 实现后必须由实际输出替换。 这是阶段 A 的诚实标注，不是最终数字。
+
+4.2 前置定义块（扩展，A-P0-4）
+
+§17 开头的前置定义块追加：
+
+```neura
+// === 前置定义块（所有 §17 示例共享）===
+struct Substance { amount: Float; temperature: Float }
+struct Tool      { id: Int }
+
+fn is_liquid(s: Substance) -> Bool { s.temperature > 0.0 }
+fn compute_min(s: Size) -> Size { s }
+
+logic SomeLogic {
+  structure: { user_id: Int }
+  capability: { run() -> Unit {} }
+}
+
+instance Bar : SomeLogic {
+  structure: { user_id: 42 }
+}
+
+// 新增：synapse 前置（N10 依赖）
+neuron Src {
+  output o: Signal<Int>
+}
+neuron Dst {
+  input i: Signal<Int>
+}
+```
+
+4.3 负例（12 条，修 5 条 P0）
+
+```neura
+// N1 [compile]
+fn f1() -> Unit {
+  let x = 1 let y = 2
+}
+// 期望: E-SAME-LINE-STMT, line=3, col=13, 「同行多条语句必须用 ; 分隔」
+// [待 parser 验证]
+
+// N2 [compile]
+logic Bad1 hazardous {
+  structure: { x: Int }
+}
+// 期望: E-HAZARD-NO-WITH, line=2, col=12, 「hazardous 必须作为 with 的 modifier」
+// [待 parser 验证]
+
+// N3 [compile]
+logic Bad2 with hazardous {
+  structure: { x: Int }
+}
+// 期望: E-HAZARD-NO-GUARD, line=1, col=1, 「hazardous logic 必须 strict 或带 guard」
+// [待 parser 验证]
+
+// N4 [compile]（v0.3.7 修 col）
+place SomeLogic at local where foo_bar >= 1
+// 期望: E-UNKNOWN-WHERE-IDENT, line=1, col=32, 「未知标识符 foo_bar」
+// [待 parser 验证]  col=32 是 foo_bar 的 f（v0.3.6 的 28 是 where 的 e，错误）
+
+// N5 [compile]（v0.3.7 修 col）
+place Bar at ["a","b"] balance consistent_hash(nonexistent)
+// 期望: E-HASH-FIELD-NOT-FOUND, line=1, col=48,
+//       「consistent_hash 字段 nonexistent 不在 structure 中」
+// [待 parser 验证]  col=48 是 nonexistent 的 n（v0.3.6 的 41 是 consistent_hash 内部）
+
+// N6 [runtime-test]
+fn n6(x: SomeLogic) -> Unit {
+  match x against LogicDB {
+    case SomeLogic(e) => { invoke e.run() }
+  }
+}
+// 期望: LogicDB 无 SomeLogic instance 时不匹配、跳过；有则绑定 e
+
+// N7 [compile]
+fn g(p: (Int)) -> Unit {}
+// 期望: E-PAREN-SINGLE-TYPE, line=1, col=9, 「单元素括号在类型位置非法」
+// [待 parser 验证]
+
+// N8 [compile]
+fn h() -> Unit {
+  let x = -55mV
+}
+// 期望: E-UNIT-OUTSIDE-PHYSICS, line=2, col=11, 「unit_lit 仅在 physics_value 位置合法」
+// [待 parser 验证]  col=11 是 -（unary minus 起始，按规则 20 的 span 定义）
+
+// N9 [compile]（v0.3.7 修 col）
+place Bar at "a" failover retry(3)
+// 期望: E-WRONG-POLICY, line=1, col=27, 「retry 属于 failure_policy」
+// [待 parser 验证]  col=27 是 retry 的 r（v0.3.6 的 25 是 failover 的 r，错误）
+
+// N10 [compile]（v0.3.7 重写，前置加 neuron Src/Dst）
+synapse Src.o -> Dst.i on_failure failover
+// 期望: E-WRONG-POLICY, line=1, col=51, 「failover 属于 failover_policy」
+// [待 parser 验证]  col=51 是 failover 的 f
+// v0.3.6 的 SomeLogic.run 不是端口，checker 先报「无输出端口」，到不了本错误
+
+// N11 [compile]
+fn f2() -> Unit {
+  break
+}
+// 期望: E-BREAK-OUTSIDE-LOOP, line=2, col=3, 「break 只能出现在循环体内」
+// [待 parser 验证]
+
+// N12 [compile]（v0.3.7 重写，用 learn 触发日志副作用）
+fn bad_fn() -> Size {
+  learn(1)
+  0GB
+}
+place Bar at local where gpu_mem >= bad_fn()
+// 期望: E-WHERE-NOT-PURE, line=6, col=27,
+//       「where 表达式的函数必须是纯函数（含 learn 日志副作用）」
+// [待 parser 验证]  col=27 是 bad_fn 的 b
+// v0.3.6 的 let mut 赋值不是副作用，bad_fn 是纯函数，期望无法触发
+```
+
+4.4 正例（7 条，标注 expected: parse+check OK）
+
+正例统一标注 expected: parse+check OK（C-1），与负例的 E-* 码对称。P1–P7 内容不变，仅标注更新。
+
+4.5 §17 纪律（更新）
+
+阶段 A（v0.3.7）：负例的 expected_error_span 人工数，标注 [待 parser 验证]。CI 跑 parser，输出实际 span，与 expected 比对，不一致 → warn（不阻断），生成 §17 列号待更新: N4 col 28→32 之类提示。人工确认 warn 内容，决定是否更新 §17。
+
+阶段 B（parser 实现后）：parser 输出实际 span → 人工确认正确 → 更新 §17 → CI 改为阻断（不一致 → 阻断合并）。
+
+阶段 C（稳定后）：parser --dump-errors 自动生成 §17 的 expected_error_span，人工只审 message。
+
+v0.3.7 的列号是阶段 A 的人工数，不是最终数字。 任何「§17 列号已对齐」的声明必须附带 [parser 实际输出] 标注，否则视为阶段 A 未完成。
+
+---
+
+5. CI 流程（三阶段，新增）
+
+§16 追加：
+
+☐ 阶段 A CI（v0.3.7 当前）：跑 parser，输出实际 error span，与 §17 expected 比对。不一致 → warn，输出 diff，不阻断合并。人工确认后更新 §17。
+☐ 阶段 B CI（parser 实现后）：同阶段 A，但不一致 → 阻断合并。§17 的 expected 必须与 parser 实际输出逐字段一致。
+☐ 阶段 C CI（稳定后）：parser --dump-errors 生成 §17，CI 只校验 message 可读性（非空、不含 TODO、不含 [待 parser 验证]）。
+☐ §17 自包含检查：脚本提取每条示例的未定义 ident，与前置定义块比对；有未定义且不在前置块 → 阻断合并。
+☐ --dump-tokens diff：虚拟分号插入/不插入状态变化 → 阻断合并。
+☐ .. / ..= token 校验：--dump-tokens 中 0..10 必须输出 int_lit .. int_lit，不得拆为 . .。
+
+错误码注册表追加：
+
+码 规则 信息
+E-ASSIGN-LHS 11（expr） = 左侧不能是字面量
+E-RANGE-OUTSIDE-FOR 36 a..b 仅在 for 的 expr 位置合法
+
+---
+
+6. 变更日志（增量）
+
+版本 变更
+v0.3.6 （见前，内建类型名 lexer 身份、例外合并、emit 规则 37、for 迭代、§17 expected_error_span 等）
+v0.3.7 修 5 条 §17 P0（N4 col 32、N5 col 48、N9 col 27、N10 重写 + neuron 前置 + col 51、N12 改用 learn + col 27）、§17 三阶段流程（A 人工+warn / B parser+阻断 / C 自动生成）、规则 14 删除并入 37、§1.2 补 .. ..=、§1.3 例外加「行首 = 抑制」、规则 20 span 定义、规则 35 副作用清单、规则 39 局部 mut 不算副作用、规则 36 Range 不可显式声明、内建类型名核对 20 个、正例标注 parse+check OK、错误码注册表追加 E-ASSIGN-LHS/E-RANGE-OUTSIDE-FOR
+
+---
+
+7. 对评审的回应
+
+A-P0-1（N4 col 28 → 32）：确认。foo_bar 的 f 在 col 32。
+
+A-P0-2（N5 col 41 → 48）：确认。nonexistent 的 n 在 col 48。
+
+A-P0-3（N9 col 25 → 27）：确认结论。细节小误：col=25 是 failover 的 r，不是 e（f=18, a=19, i=20, l=21, o=22, v=23, e=24, r=25）。不影响结论——col=25 确实不是 retry 的起始。已改 col=27。
+
+A-P0-4（N10 重写）：确认。SomeLogic.run 是 capability 不是端口，checker 先报「无输出端口」。已前置加 neuron Src { output o: Signal<Int> } / neuron Dst { input i: Signal<Int> }，N10 改为 synapse Src.o -> Dst.i on_failure failover，col=51。
+
+A-P0-5（N12 重写）：确认。局部 mut 赋值不是副作用，bad_fn 是纯函数。已改用 learn(1) 触发日志副作用，规则 35/39 明确「learn 视为非纯，局部 mut 不算副作用」。
+
+B-1（规则 14/37 编号）：确认。已删规则 14，并入 37，§12 编号有空洞但 CI 按错误码对拍不依赖编号。
+
+B-2（行首 = 抑制）：确认。已加例外 4。副作用是 let x = 1\n= 2 被解析为 let x = 1 = 2 后报 E-ASSIGN-LHS，错误更准确。
+
+B-3（.. 运算符）：确认。§1.2 已补 .. ..=，写明独立 token 不拆分，lexer lookahead 规则。
+
+B-4（Range 显式声明）：确认。规则 36 已补「Range 是 for 专用类型，不可显式声明」。
+
+B-5（内建类型名数量）：核对为 20 个（评审说 19 个，漏数了 Never 或 Bytes 之一；逐个核对：Int/Int32/Int64/Float/F32/F64/Bool/String/Unit/Bytes/Never/Duration/Size/Signal/Option/Result/Vec/Set/Map/Graph）。
+
+B-6（局部 mut 语义）：确认。规则 39 已加。
+
+C-1（正例标注）：确认。已改 expected: parse+check OK。
+
+C-2（E-UNIT-OUTSIDE-PHYSICS span）：确认。规则 20 已写明 span 为 [ - ] (int|float) ident 的起始 token。
+
+F（流程建议，最关键）：采纳全部。这是 v0.3.7 唯一重要的修复——不是修 5 个列号，是把「人工数 → 对拍 → 人工改」改成三阶段：
+
+· 阶段 A：人工数 + [待 parser 验证] 标注 + CI warn（不阻断）
+· 阶段 B：parser 输出替换人工数 + CI 阻断
+· 阶段 C：parser --dump-errors 自动生成 + 人工只审 message
+
+v0.3.6 的错误是把阶段 B 和 C 跳过了，直接「人工写死 + 阻断」。结果人工写错，阻断机制形同虚设。v0.3.7 明确：当前是阶段 A，列号是人工数，parser 实现后必须由实际输出替换。 这是诚实标注，不是最终数字。
+
+---
+
+一句话：v0.3.7 修掉 5 个 P0（N4/N5/N9/N10/N12 的列号或示例重写）、6 个 P1（规则 14 并入 37、.. 运算符、行首 = 抑制、规则 20 span、规则 35 副作用清单、规则 39、Range 显式声明）、2 个 P2。最重要的修复不是列号，是 §17 的三阶段流程——阶段 A 人工数 + warn，阶段 B parser 输出 + 阻断，阶段 C 自动生成。v0.3.6 的「人工写死 + 阻断」是把阶段 B/C 跳过，结果人工写错阻断失效。v0.3.7 明确当前是阶段 A，列号是人工数、标注待验证。这是诚实的、可落地的流程，不是纸面承诺。

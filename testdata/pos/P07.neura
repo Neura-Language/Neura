@@ -1,0 +1,20 @@
+logic Counter {
+  structure: { n: Int }
+  capability: {
+    bump() -> Unit {
+      self.n = 1
+    }
+  }
+}
+instance C : Counter { structure: { n: 0 } }
+
+fn pure_max(a: Int, b: Int) -> Int {
+  if a > b { a } else { b }
+}
+
+fn impure_log(x: Int) -> Int {
+  learn(x)
+  x
+}
+
+place C at local where pure_max(gpu_mem, 1) >= 1

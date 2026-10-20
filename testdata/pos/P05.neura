@@ -1,0 +1,7 @@
+fn pair(a: (Int, String)) -> (Int, String) { a }
+
+fn apply(f: fn(Int, Int) -> Int, x: Int) -> Int { f(x, x) }
+
+fn pair_add(a: Int, b: Int) -> Int { a + b }
+
+fn use_apply() -> Int { apply(pair_add, 1) }

@@ -1,0 +1,49 @@
+// Phase 4 runtime 演示：LogicDB + match + reuse/invoke/emit + MatchTrace + place
+logic Router {
+  structure: { region: String; weight: Int }
+  capability: {
+    run() -> Unit {
+      learn(1)
+    }
+  }
+}
+
+instance RouterEU : Router { structure: { region: "eu"; weight: 10 } }
+instance RouterUS : Router { structure: { region: "us"; weight: 20 } }
+
+neuron In { output o: Signal<Int> }
+neuron Out { input i: Signal<Int> }
+synapse In.o -> Out.i on_failure retry(2) failover failover
+
+neuron Worker {
+  input w: Signal<Int>
+  handle {
+    emit w
+  }
+}
+
+place RouterEU at local where gpu_mem >= 1
+place RouterUS at ["node-a", "node-b"] balance consistent_hash(region)
+
+fn dispatch(x: Router) -> Unit {
+  match x against LogicDB {
+    case RouterEU(e) => { invoke e.run() }
+    case Router(r) => reuse r
+  }
+}
+
+fn sum_between(lo: Int, hi: Int) -> Int {
+  let mut total = 0
+  for i in lo..hi {
+    total = total + i
+  }
+  total
+}
+
+fn sum_to(n: Int) -> Int {
+  let mut total = 0
+  for i in 0..=n {
+    total = total + i
+  }
+  total
+}

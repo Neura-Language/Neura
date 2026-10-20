@@ -1,0 +1,26 @@
+// === 前置定义块（所有 §17 示例共享，v0.3.7 §17 原文）===
+struct Substance { amount: Float; temperature: Float }
+struct Tool      { id: Int }
+
+fn is_liquid(s: Substance) -> Bool { s.temperature > 0.0 }
+fn compute_min(s: Size) -> Size { s }
+
+logic SomeLogic {
+  structure: { user_id: Int }
+  capability: { run() -> Unit {} }
+}
+
+instance Bar : SomeLogic {
+  structure: { user_id: 42 }
+}
+
+// 新增：synapse 前置（N10 依赖）
+neuron Src {
+  output o: Signal<Int>
+}
+neuron Dst {
+  input i: Signal<Int>
+}
+
+// ---- N10 ----
+synapse Src.o -> Dst.i on_failure failover

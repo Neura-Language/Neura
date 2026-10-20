@@ -1,0 +1,127 @@
+[
+  {
+    "file": "testdata/neg/N01.neura",
+    "diagnostics": [
+      {
+        "line": 27,
+        "col": 13,
+        "code": "E-SAME-LINE-STMT",
+        "msg": "同行多条语句必须用 ; 分隔"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N02.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 12,
+        "code": "E-HAZARD-NO-WITH",
+        "msg": "hazardous 必须作为 with 的 modifier"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N03.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 1,
+        "code": "E-HAZARD-NO-GUARD",
+        "msg": "hazardous logic 必须 strict 或带 guard"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N04.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 32,
+        "code": "E-UNKNOWN-WHERE-IDENT",
+        "msg": "未知标识符 foo_bar"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N05.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 48,
+        "code": "E-HASH-FIELD-NOT-FOUND",
+        "msg": "consistent_hash 字段 nonexistent 不在 Bar 的 structure 中"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N06.neura",
+    "diagnostics": []
+  },
+  {
+    "file": "testdata/neg/N07.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 9,
+        "code": "E-PAREN-SINGLE-TYPE",
+        "msg": "单元素括号在类型位置非法；元组请写 (T,) 或 (T, U)"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N08.neura",
+    "diagnostics": [
+      {
+        "line": 27,
+        "col": 11,
+        "code": "E-UNIT-OUTSIDE-PHYSICS",
+        "msg": "unit_lit 仅在 physics_value 位置合法"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N09.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 27,
+        "code": "E-WRONG-POLICY",
+        "msg": "retry 属于 failure_policy，不能用在 failover 位置"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N10.neura",
+    "diagnostics": [
+      {
+        "line": 26,
+        "col": 35,
+        "code": "E-WRONG-POLICY",
+        "msg": "failover 属于 failover_policy，不能用在 on_failure 位置"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N11.neura",
+    "diagnostics": [
+      {
+        "line": 27,
+        "col": 3,
+        "code": "E-BREAK-OUTSIDE-LOOP",
+        "msg": "break 只能出现在循环体内"
+      }
+    ]
+  },
+  {
+    "file": "testdata/neg/N12.neura",
+    "diagnostics": [
+      {
+        "line": 30,
+        "col": 37,
+        "code": "E-WHERE-NOT-PURE",
+        "msg": "where 表达式的函数必须是纯函数（含 learn 日志副作用）"
+      }
+    ]
+  }
+]

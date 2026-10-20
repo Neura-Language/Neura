@@ -1,0 +1,11 @@
+logic Echo {
+  structure: { n: Int }
+  capability: { run() -> Unit {} }
+}
+instance E1 : Echo { structure: { n: 1 } }
+
+fn go(x: Echo) -> Unit {
+  match x against LogicDB {
+    case E1(e) => { invoke e.run() }
+  }
+}

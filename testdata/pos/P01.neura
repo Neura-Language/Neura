@@ -1,0 +1,11 @@
+struct Point { x: Int; y: Int }
+
+fn manhattan(p: Point) -> Int {
+  let mut sum = 0
+  if p.x < 0 {
+    sum = sum - p.x
+  } else {
+    sum = sum + p.x
+  }
+  sum
+}

@@ -1,0 +1,29 @@
+// Phase 1 lexer 冒烟样例：覆盖 ;ᵥ、单位、范围、限定标识符。
+struct Substance { amount: Float; temperature: Float }
+
+fn is_liquid(s: Substance) -> Bool { s.temperature > 0.0 }
+
+fn window(ms: Int) -> Duration { 20ms }
+
+let total = 1.5GB
+let tiny = -55mV
+for i in 0..10 { learn(i) }
+let r = 0..=5
+
+self.last
+  = Option<Int>
+
+logic SomeLogic {
+  structure: { user_id: Int }
+  capability: { run() -> Unit {} }
+}
+
+instance Bar : SomeLogic {
+  structure: { user_id: 42 }
+}
+
+neuron Src { output o: Signal<Int> }
+neuron Dst { input i: Signal<Int> }
+
+synapse Src.o -> Dst.i on_failure failover
+place Bar at local where gpu_mem >= 1

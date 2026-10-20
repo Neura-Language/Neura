@@ -1,0 +1,84 @@
+// Phase 2 解析验收样例：覆盖 §17 用到的全部语法 + 必做项。
+// 注意：本文件只要求 parse 无错；语义规则（hazardous 的 guard、where 纯函数等）属 Phase 3。
+
+struct Substance {
+  amount: Float
+  temperature: Float
+}
+
+struct Tool { id: Int }
+
+fn is_liquid(s: Substance) -> Bool { s.temperature > 0.0 }
+
+fn pair(a: (Int, String)) -> () { }
+
+fn apply(f: fn(Int, Int) -> Int, x: Int) -> Int { f(x, x) }
+
+fn range_sum(n: Int) -> Int {
+  let mut total = 0
+  for i in 0..n {
+    total = total + i
+  }
+  for i in 0..=3 {
+    if total > 100 { break }
+    total = total + i
+  }
+  total
+}
+
+fn classify(n: Int) -> String {
+  let mut label = "unknown"
+  if n < 0 {
+    label = "negative"
+  } else if n == 0 {
+    label = "zero"
+  }
+  else {
+    label = "positive"
+  }
+  label
+}
+
+fn physical() -> Unit {
+  let size = 1.5GB
+  let window = 20ms
+  learn(1)
+}
+
+logic SomeLogic with hazardous strict {
+  structure: { user_id: Int }
+  capability: {
+    run() -> Unit {}
+    size() -> Int
+  }
+}
+
+instance Bar : SomeLogic {
+  structure: { user_id: 42 }
+}
+
+neuron Src { output o: Signal<Int> }
+neuron Dst { input i: Signal<Int> }
+
+neuron Worker {
+  input src: Signal<Int>
+  output out: Signal<Int>
+  handle {
+    emit src
+  }
+}
+
+synapse Src.o -> Dst.i on_failure retry(3) failover failover
+
+fn dispatch(x: SomeLogic) -> Unit {
+  match x against LogicDB {
+    case SomeLogic(e) => { invoke e.run() }
+    case Bar(b) => reuse b
+  }
+}
+
+place Bar at local where gpu_mem >= 1
+
+place SomeLogic at ["a", "b"] balance consistent_hash(user_id) where user_id >= 1 failover failover on_failure retry(3)
+
+place Tool at "node-1" balance round_robin where id >= 0

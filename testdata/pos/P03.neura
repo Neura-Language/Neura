@@ -1,0 +1,12 @@
+neuron A { output o: Signal<Int> }
+neuron B { input i: Signal<Int> }
+
+synapse A.o -> B.i on_failure retry(2) failover failover
+
+logic L {
+  structure: { k: Int }
+  capability: { run() -> Unit {} }
+}
+instance I : L { structure: { k: 7 } }
+
+place I at local where gpu_mem >= 1

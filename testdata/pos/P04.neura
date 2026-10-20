@@ -1,0 +1,11 @@
+fn sum_odds(n: Int) -> Int {
+  let mut total = 0
+  for i in 0..n {
+    if i == 0 { continue }
+    total = total + i
+  }
+  for j in 0..=5 {
+    if j > 3 { break }
+  }
+  total
+}

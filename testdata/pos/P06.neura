@@ -1,0 +1,7 @@
+logic L6 {
+  structure: { user_id: Int; region: String }
+  capability: { run() -> Unit {} }
+}
+instance I6 : L6 { structure: { user_id: 1; region: "eu" } }
+
+place I6 at ["a", "b"] balance consistent_hash(user_id) where user_id >= 1
