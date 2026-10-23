@@ -145,10 +145,15 @@ type Candidate struct {
 	Strict   bool    `json:"strict"`
 	Score    float64 `json:"score"`
 	Guard    bool    `json:"guard"`
+	Provider string  `json:"provider,omitempty"`
 }
 
 // TraceRecord 是 MatchTrace 的一行（JSONL）。不含时间戳，保证可复现。
 type TraceRecord struct {
+	TraceID    string      `json:"trace_id,omitempty"`
+	Node       string      `json:"node,omitempty"`
+	Depth      int         `json:"depth,omitempty"`
+	Local      int         `json:"local,omitempty"`
 	Seq        int         `json:"seq"`
 	Subject    string      `json:"subject"`
 	Logic      string      `json:"logic"`

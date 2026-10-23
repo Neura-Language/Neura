@@ -1,0 +1,7 @@
+neura-bin
+*.exe
+*.out
+*.test
+.idea/
+.vscode/
+.DS_Store

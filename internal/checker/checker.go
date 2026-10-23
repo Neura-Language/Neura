@@ -545,17 +545,31 @@ func (c *Checker) checkNeuron(n *ast.NeuronDecl) {
 		c.checkType(p.Type)
 	}
 
-	savedEmit, savedLogic, savedLoop, savedResult := c.emitOK, c.inLogic, c.loopDepth, c.curResult
-	c.emitOK, c.inLogic, c.loopDepth, c.curResult = true, false, 0, "Unit"
-	c.pushScope()
-	for _, p := range n.Ports {
-		c.declareVar(p.Name, varInfo{Type: sigOf(p.Type), Mutable: false}, p.At)
+	// 每个 handler 单独一个作用域：端口可见，signal 名绑定为声明类型，emit 合法（规则 37）。
+	checkHandler := func(sh *ast.SignalHandler, body *ast.Block) {
+		if sh != nil {
+			c.checkType(sh.Type)
+		}
+		savedEmit, savedLogic, savedLoop, savedResult := c.emitOK, c.inLogic, c.loopDepth, c.curResult
+		c.emitOK, c.inLogic, c.loopDepth, c.curResult = true, false, 0, "Unit"
+		c.pushScope()
+		for _, p := range n.Ports {
+			c.declareVar(p.Name, varInfo{Type: sigOf(p.Type), Mutable: false}, p.At)
+		}
+		if sh != nil && sh.Name != "" {
+			c.declareVar(sh.Name, varInfo{Type: sigOf(sh.Type), Mutable: false}, sh.At)
+		}
+		c.checkBlock(body)
+		c.popScope()
+		c.emitOK, c.inLogic, c.loopDepth, c.curResult = savedEmit, savedLogic, savedLoop, savedResult
+	}
+
+	for _, sh := range n.Signals {
+		checkHandler(sh, sh.Body)
 	}
 	if n.Handler != nil {
-		c.checkBlock(n.Handler)
+		checkHandler(nil, n.Handler)
 	}
-	c.popScope()
-	c.emitOK, c.inLogic, c.loopDepth, c.curResult = savedEmit, savedLogic, savedLoop, savedResult
 }
 
 // 规则 28 / 29：synapse 两端端口必须存在、方向正确、类型一致。

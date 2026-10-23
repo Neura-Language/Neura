@@ -292,10 +292,25 @@ type Binding struct {
 }
 
 type NeuronDecl struct {
-	At      diag.Pos
-	Name    string
-	Ports   []*Port
+	At    diag.Pos
+	Name  string
+	Ports []*Port
+
+	// Signals 是 EBNF 的 `on signal <name>: <Type> from <source> { ... }` 处理器（可多个）。
+	Signals []*SignalHandler
+
+	// Handler 是早期实现用的 `handle { ... }`，保留为兼容别名（文档标注 legacy）。
 	Handler *Block
+}
+
+// SignalHandler 对应 `on signal amount: Float from tx { ... }`。
+// From 是外部来源名（tx / events …），本阶段只记录、不做连接校验。
+type SignalHandler struct {
+	At   diag.Pos
+	Name string
+	Type Type
+	From string
+	Body *Block
 }
 
 type Port struct {

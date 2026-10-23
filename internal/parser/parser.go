@@ -149,6 +149,83 @@ func (p *parser) expectIdent(what string) string {
 	return ""
 }
 
+// ---------------- 分隔符 / 软关键字 ----------------
+//
+// Neura 的 ;ᵥ 只在「终止集合 + 换行」时插入，而字段列表允许用换行、; 或 , 分隔。
+// 所以字段/绑定/端口列表统一走 skipSemis / skipSeparators + endField，
+// 不再假设「一个字段后一定紧跟一个 ;ᵥ」。
+
+// skipSemis 跳过任意个 ; / ;ᵥ（参数表、泛型实参、调用实参里只可能有分号）。
+func (p *parser) skipSemis() {
+	for p.isSemi() {
+		p.advance()
+	}
+}
+
+// skipSeparators 跳过任意个 ; / ;ᵥ / ,（字段、绑定、端口列表）。
+func (p *parser) skipSeparators() {
+	for p.isSemi() || p.atPunct(",") {
+		p.advance()
+	}
+}
+
+// softKeywords 是可以出现在「名字位置」的上下文关键字（on signal … from …），
+// 这样 struct 里叫 signal / from 的字段依然可用。
+var softKeywords = map[string]bool{"on": true, "signal": true, "from": true}
+
+func (p *parser) atIdentName(name string) bool {
+	t := p.cur()
+	return (t.Kind == lexer.Ident || t.Kind == lexer.Keyword) && t.Lexeme == name
+}
+
+// expectIdentSoft 用于端口名 / signal 名这类位置：允许软关键字当名字。
+func (p *parser) expectIdentSoft(what string) string {
+	t := p.cur()
+	if t.Kind == lexer.Ident || (t.Kind == lexer.Keyword && softKeywords[t.Lexeme]) {
+		p.advance()
+		return t.Lexeme
+	}
+	p.fail(t, diag.CodeUnexpectedToken, "期望"+what+"（标识符），实际是 "+describe(t))
+	return ""
+}
+
+// endField 处理 struct / logic structure 的字段分隔：; / ;ᵥ / , / 换行 / } 都合法。
+// 其余情况给出精确诊断（而不是落到下一轮 expectIdent 的「期望字段名」）。
+func (p *parser) endField(kind string) {
+	if p.isSemi() || p.atPunct(",") {
+		p.advance()
+		return
+	}
+	if p.atPunct("}") || p.atEOF() {
+		return
+	}
+	if p.atPunct("=") {
+		bad := p.cur()
+		p.advance()
+		_ = p.parseExpr() // 吞掉默认值，避免级联
+		p.errorAt(bad, diag.CodeUnexpectedToken,
+			kind+"只声明 name: Type，不能带默认值（是否漏了 ; ？）")
+		return
+	}
+	if p.cur().Line == p.prev().Line {
+		p.errorAt(p.cur(), diag.CodeSameLineStmt, "同行"+kind+"必须用 ; 或 , 分隔")
+	}
+}
+
+// endBinding 同 endField，但 instance structure 的值是表达式（没有默认值语法）。
+func (p *parser) endBinding() {
+	if p.isSemi() || p.atPunct(",") {
+		p.advance()
+		return
+	}
+	if p.atPunct("}") || p.atEOF() {
+		return
+	}
+	if p.cur().Line == p.prev().Line {
+		p.errorAt(p.cur(), diag.CodeSameLineStmt, "同行 binding 必须用 ; 或 , 分隔")
+	}
+}
+
 // ---------------- 顶层 ----------------
 
 var declStart = map[string]bool{
@@ -267,6 +344,10 @@ func (p *parser) parseParams() []*ast.Param {
 	p.expectPunct("(")
 	params := []*ast.Param{}
 	for !p.atPunct(")") && !p.atEOF() {
+		p.skipSemis()
+		if p.atPunct(")") {
+			break
+		}
 		nameTok := p.cur()
 		name := p.expectIdent("参数名")
 		p.expectPunct(":")
@@ -357,19 +438,17 @@ func (p *parser) parseStructDecl() *ast.StructDecl {
 	p.expectPunct("{")
 	d := &ast.StructDecl{At: posOf(t), Name: name}
 	for !p.atPunct("}") && !p.atEOF() {
-		if p.isSemi() || p.atPunct(",") {
-			p.advance()
-			continue
+		p.skipSeparators()
+		if p.atPunct("}") || p.atEOF() {
+			break
 		}
 		fTok := p.cur()
-		fname := p.expectIdent("字段名")
+		fname := p.expectIdentSoft("字段名")
 		p.expectPunct(":")
 		// struct 用 field：值是类型
 		ft := p.parseType()
 		d.Fields = append(d.Fields, &ast.Field{At: posOf(fTok), Name: fname, Type: ft})
-		if p.isSemi() || p.atPunct(",") {
-			p.advance()
-		}
+		p.endField("字段")
 	}
 	p.expectPunct("}")
 	return d
@@ -424,18 +503,16 @@ func (p *parser) parseLogicDecl() *ast.LogicDecl {
 			p.expectPunct(":")
 			p.expectPunct("{")
 			for !p.atPunct("}") && !p.atEOF() {
-				if p.isSemi() || p.atPunct(",") {
-					p.advance()
-					continue
+				p.skipSeparators()
+				if p.atPunct("}") || p.atEOF() {
+					break
 				}
 				fTok := p.cur()
-				fname := p.expectIdent("structure 字段名")
+				fname := p.expectIdentSoft("structure 字段名")
 				p.expectPunct(":")
 				ft := p.parseType()
 				d.Structure = append(d.Structure, &ast.Field{At: posOf(fTok), Name: fname, Type: ft})
-				if p.isSemi() || p.atPunct(",") {
-					p.advance()
-				}
+				p.endField("字段")
 			}
 			p.expectPunct("}")
 		case p.atKw("capability"):
@@ -443,11 +520,12 @@ func (p *parser) parseLogicDecl() *ast.LogicDecl {
 			p.expectPunct(":")
 			p.expectPunct("{")
 			for !p.atPunct("}") && !p.atEOF() {
-				if p.isSemi() {
-					p.advance()
-					continue
+				p.skipSemis()
+				if p.atPunct("}") || p.atEOF() {
+					break
 				}
 				d.Capability = append(d.Capability, p.parseFnSig())
+				p.skipSemis()
 			}
 			p.expectPunct("}")
 		default:
@@ -484,9 +562,9 @@ func (p *parser) parseInstanceDecl() *ast.InstanceDecl {
 
 	p.expectPunct("{")
 	for !p.atPunct("}") && !p.atEOF() {
-		if p.isSemi() {
-			p.advance()
-			continue
+		p.skipSemis()
+		if p.atPunct("}") || p.atEOF() {
+			break
 		}
 		if !p.atKw("structure") {
 			p.fail(p.cur(), diag.CodeUnexpectedToken,
@@ -496,19 +574,17 @@ func (p *parser) parseInstanceDecl() *ast.InstanceDecl {
 		p.expectPunct(":")
 		p.expectPunct("{")
 		for !p.atPunct("}") && !p.atEOF() {
-			if p.isSemi() || p.atPunct(",") {
-				p.advance()
-				continue
+			p.skipSeparators()
+			if p.atPunct("}") || p.atEOF() {
+				break
 			}
 			kTok := p.cur()
-			bname := p.expectIdent("binding 名")
+			bname := p.expectIdentSoft("binding 名")
 			p.expectPunct(":")
 			// instance structure 用 binding：值是表达式（不是类型）
 			val := p.parseExpr()
 			d.Bindings = append(d.Bindings, &ast.Binding{At: posOf(kTok), Name: bname, Value: val})
-			if p.isSemi() || p.atPunct(",") {
-				p.advance()
-			}
+			p.endBinding()
 		}
 		p.expectPunct("}")
 	}
@@ -522,31 +598,84 @@ func (p *parser) parseNeuronDecl() *ast.NeuronDecl {
 	p.expectPunct("{")
 	d := &ast.NeuronDecl{At: posOf(t), Name: name}
 	for !p.atPunct("}") && !p.atEOF() {
-		if p.isSemi() {
-			p.advance()
-			continue
+		p.skipSeparators()
+		if p.atPunct("}") || p.atEOF() {
+			break
 		}
 		switch {
 		case p.atKw("input"), p.atKw("output"):
 			dir := p.advance()
 			pTok := p.cur()
-			pname := p.expectIdent("端口名")
+			pname := p.expectIdentSoft("端口名")
 			p.expectPunct(":")
 			pt := p.parseType()
 			d.Ports = append(d.Ports, &ast.Port{At: posOf(pTok), Dir: dir.Lexeme, Name: pname, Type: pt})
+		case p.atIdentName("on"):
+			// EBNF：on signal <name>: <Type> from <source> { ... }
+			d.Signals = append(d.Signals, p.parseSignalHandler())
 		case p.atKw("handle"):
+			// legacy 别名（早期实现用），语义等价于一个匿名 on signal
 			p.advance()
 			d.Handler = p.parseBlock()
 		default:
 			p.fail(p.cur(), diag.CodeUnexpectedToken,
-				"neuron 体内只允许 input / output / handle，实际是 "+describe(p.cur()))
+				"neuron 体内只允许 input / output / on signal … from … / handle（legacy），实际是 "+describe(p.cur()))
 		}
-		if p.isSemi() {
-			p.advance()
-		}
+		p.skipSemis()
 	}
 	p.expectPunct("}")
 	return d
+}
+
+// parseSignalHandler：on signal <name>: <Type> from <source> <Block>
+func (p *parser) parseSignalHandler() *ast.SignalHandler {
+	onTok := p.advance() // on
+	if !p.atIdentName("signal") {
+		p.errorAt(p.cur(), diag.CodeUnexpectedToken,
+			"on 后期望 signal，实际是 "+describe(p.cur()))
+		p.skipBalancedBraces()
+		return &ast.SignalHandler{At: posOf(onTok)}
+	}
+	p.advance()
+	h := &ast.SignalHandler{At: posOf(onTok)}
+	h.Name = p.expectIdentSoft("signal 名")
+	p.expectPunct(":")
+	h.Type = p.parseType()
+	if !p.atIdentName("from") {
+		// 就地恢复：报一条精确错误，绝不把 { … } 体丢给上层造成级联
+		p.errorAt(p.cur(), diag.CodeUnexpectedToken,
+			"on signal 后期望 from，实际是 "+describe(p.cur()))
+		p.skipBalancedBraces()
+		return h
+	}
+	p.advance()
+	ref := p.parseQualifiedRef()
+	h.From = strings.Join(ref.Parts, ".")
+	h.Body = p.parseBlock()
+	return h
+}
+
+// skipBalancedBraces 跳过一个完整的 { … }（不消费外层 }）。
+func (p *parser) skipBalancedBraces() {
+	if !p.atPunct("{") {
+		return
+	}
+	depth := 0
+	for !p.atEOF() {
+		switch {
+		case p.atPunct("{"):
+			depth++
+			p.advance()
+		case p.atPunct("}"):
+			depth--
+			p.advance()
+			if depth == 0 {
+				return
+			}
+		default:
+			p.advance()
+		}
+	}
 }
 
 func (p *parser) parseSynapseDecl() *ast.SynapseDecl {
@@ -687,7 +816,7 @@ func (p *parser) parseAtSpec() *ast.AtSpec {
 		return &ast.AtSpec{At: posOf(t), Local: true}
 	case t.Kind == lexer.StringLit:
 		p.advance()
-		return &ast.AtSpec{At: posOf(t), Nodes: []string{t.Lexeme}}
+		return &ast.AtSpec{At: posOf(t), Nodes: []string{unquoteLiteral(t.Lexeme)}}
 	case t.Kind == lexer.Punct && t.Lexeme == "[":
 		p.advance()
 		spec := &ast.AtSpec{At: posOf(t)}
@@ -697,7 +826,7 @@ func (p *parser) parseAtSpec() *ast.AtSpec {
 				p.fail(n, diag.CodeUnexpectedToken, "at 列表只接受字符串节点名，实际是 "+describe(n))
 			}
 			p.advance()
-			spec.Nodes = append(spec.Nodes, n.Lexeme)
+			spec.Nodes = append(spec.Nodes, unquoteLiteral(n.Lexeme))
 			if p.atPunct(",") {
 				p.advance()
 				continue
@@ -1158,6 +1287,34 @@ func assignLHSMsg(e ast.Expr) string {
 		return fmt.Sprintf("= 左侧必须是变量，不能是字面量 %s（是否漏了 ; ？）", lit.Text)
 	}
 	return "= 左侧必须是变量（是否漏了 ; ？）"
+}
+
+// unquoteLiteral 去掉字符串字面量的引号并处理常见转义。
+// AST 里存语义字符串（节点地址要能直接拨号），不是原始 token 文本。
+func unquoteLiteral(s string) string {
+	if len(s) < 2 || (s[0] != '"' && s[0] != '\'') {
+		return s
+	}
+	body := s[1 : len(s)-1]
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\\' && i+1 < len(body) {
+			i++
+			switch body[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			default:
+				b.WriteByte(body[i])
+			}
+			continue
+		}
+		b.WriteByte(body[i])
+	}
+	return b.String()
 }
 
 func (p *parser) parseQualifiedRef() *ast.QualifiedRef {

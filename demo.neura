@@ -1,0 +1,22 @@
+struct Account {
+  user: String
+  balance: Float
+}
+
+// 计算交易手续费的纯函数
+fn calc_fee(amount: Float) -> Float {
+  let rate = 0.015
+  return amount * rate
+}
+
+// 一个简单的风控神经元
+neuron RiskControl {
+  input  tx: Signal<Float>
+  output alert: Signal<String>
+
+  on signal amount: Float from tx {
+    if amount > 10000.0 {
+      emit alert "Warning: Large transaction!"
+    }
+  }
+}

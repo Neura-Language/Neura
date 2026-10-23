@@ -421,7 +421,7 @@ place L at local where gpu_mem >= bad_fn()`
 	if p2.Balance == nil || p2.Balance.Kind != "consistent_hash" || len(p2.Balance.Args) != 1 {
 		t.Fatalf("balance = %+v", p2.Balance)
 	}
-	if len(p2.AtSpec.Nodes) != 2 || p2.AtSpec.Nodes[0] != `"a"` {
+	if len(p2.AtSpec.Nodes) != 2 || p2.AtSpec.Nodes[0] != "a" {
 		t.Fatalf("at nodes = %v", p2.AtSpec.Nodes)
 	}
 }
@@ -541,5 +541,152 @@ func TestDumpDeterministic(t *testing.T) {
 	}
 	if !strings.Contains(a, `Name: "f"`) {
 		t.Fatalf("dump missing name:\n%s", a)
+	}
+}
+
+// ---------------- 回归：struct 多行字段（无显式 ;） ----------------
+
+func TestStructMultilineFields(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{"no_semi", "struct S {\n  a: Int\n  b: Float\n}", []string{"a", "b"}},
+		{"no_semi_user_like", "struct Substance {\n  amount: Float\n  temperature: Float\n}", []string{"amount", "temperature"}},
+		{"blank_line", "struct S {\n  a: Int\n\n  b: Float\n}", []string{"a", "b"}},
+		{"comment", "struct S {\n  // c\n  a: Int // t\n  b: Float\n}", []string{"a", "b"}},
+		{"comma", "struct S {\n  a: Int,\n  b: Float,\n}", []string{"a", "b"}},
+		{"semi", "struct S {\n  a: Int;\n  b: Float;\n}", []string{"a", "b"}},
+		{"trailing_comma", "struct S {\n  a: Int,\n  b: Float,\n}", []string{"a", "b"}},
+		{"crlf", "struct S {\r\n  a: Int\r\n  b: Float\r\n}\r\n", []string{"a", "b"}},
+		{"brace_same_line", "struct S { a: Int\n  b: Float }", []string{"a", "b"}},
+		{"soft_keyword_names", "struct S {\n  signal: Int\n  from: Float\n  on: Bool\n}", []string{"signal", "from", "on"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := parseOK(t, c.src)
+			sd, ok := f.Decls[0].(*ast.StructDecl)
+			if !ok {
+				t.Fatalf("decl = %T, want *ast.StructDecl", f.Decls[0])
+			}
+			if len(sd.Fields) != len(c.want) {
+				t.Fatalf("fields = %d, want %d (%+v)", len(sd.Fields), len(c.want), sd.Fields)
+			}
+			for i, name := range c.want {
+				if sd.Fields[i].Name != name {
+					t.Fatalf("field[%d] = %q, want %q", i, sd.Fields[i].Name, name)
+				}
+			}
+		})
+	}
+}
+
+func TestStructMultilineUserType(t *testing.T) {
+	f := parseOK(t, "struct T { z: Int }\nstruct S {\n  t: T\n  n: Int\n}")
+	if len(f.Decls) != 2 {
+		t.Fatalf("decls = %d, want 2", len(f.Decls))
+	}
+	sd := f.Decls[1].(*ast.StructDecl)
+	if len(sd.Fields) != 2 || sd.Fields[0].Name != "t" || sd.Fields[1].Name != "n" {
+		t.Fatalf("fields = %+v", sd.Fields)
+	}
+}
+
+// 字段后多一个 token（典型：写了默认值）要给出精确诊断，而不是「期望字段名」。
+func TestStructFieldDefaultValueDiagnostic(t *testing.T) {
+	src := "struct S {\n  a: Int = 1\n  b: Int\n}"
+	err := expectSingle(t, src)
+	if err.Code != diag.CodeUnexpectedToken {
+		t.Fatalf("code = %s", err.Code)
+	}
+	if !strings.Contains(err.Msg, "不能带默认值") {
+		t.Fatalf("message = %q", err.Msg)
+	}
+	if err.Pos != tokenPos(t, src, 0, lexeme("=")) {
+		t.Fatalf("span = %s, want = token", err.Pos)
+	}
+}
+
+// 同一行两个字段必须用分隔符：报 E-SAME-LINE-STMT 而不是「期望字段名」。
+func TestStructSameLineFieldsRejected(t *testing.T) {
+	src := "struct S { a: Int b: Int }"
+	err := expectSingle(t, src)
+	if err.Code != diag.CodeSameLineStmt {
+		t.Fatalf("code = %s, want %s", err.Code, diag.CodeSameLineStmt)
+	}
+	if err.Pos != tokenPos(t, src, 0, lexeme("b")) {
+		t.Fatalf("span = %s, want 第 2 个字段名 b", err.Pos)
+	}
+}
+
+// ---------------- on signal（EBNF） ----------------
+
+func TestOnSignalHandler(t *testing.T) {
+	src := `neuron N {
+  input i: Signal<Int>
+  output o: Signal<Bool>
+  on signal amount: Float from tx {
+    emit o
+  }
+}`
+	f := parseOK(t, src)
+	nd := f.Decls[0].(*ast.NeuronDecl)
+	if len(nd.Ports) != 2 {
+		t.Fatalf("ports = %d", len(nd.Ports))
+	}
+	if len(nd.Signals) != 1 {
+		t.Fatalf("signals = %d, want 1", len(nd.Signals))
+	}
+	sh := nd.Signals[0]
+	if sh.Name != "amount" {
+		t.Fatalf("name = %q", sh.Name)
+	}
+	if sh.From != "tx" {
+		t.Fatalf("from = %q", sh.From)
+	}
+	if nt, ok := sh.Type.(*ast.NamedType); !ok || nt.Name != "Float" {
+		t.Fatalf("type = %T %+v", sh.Type, sh.Type)
+	}
+	if sh.Body == nil || len(sh.Body.Stmts) != 1 {
+		t.Fatalf("body = %+v", sh.Body)
+	}
+	if _, ok := sh.Body.Stmts[0].(*ast.EmitStmt); !ok {
+		t.Fatalf("body stmt = %T", sh.Body.Stmts[0])
+	}
+	if nd.Handler != nil {
+		t.Fatal("on signal 不应写入 legacy Handler")
+	}
+}
+
+func TestOnSignalMultipleAndQualifiedSource(t *testing.T) {
+	src := `neuron N {
+  on signal a: Float from tx { }
+  on signal b: Int from db.events { }
+}`
+	f := parseOK(t, src)
+	nd := f.Decls[0].(*ast.NeuronDecl)
+	if len(nd.Signals) != 2 {
+		t.Fatalf("signals = %d, want 2", len(nd.Signals))
+	}
+	if nd.Signals[1].From != "db.events" {
+		t.Fatalf("from = %q, want db.events", nd.Signals[1].From)
+	}
+}
+
+func TestOnSignalRequiresFrom(t *testing.T) {
+	src := "neuron N {\n  on signal amount: Float { }\n}"
+	err := expectSingle(t, src)
+	if err.Code != diag.CodeUnexpectedToken || !strings.Contains(err.Msg, "from") {
+		t.Fatalf("code=%s msg=%q", err.Code, err.Msg)
+	}
+}
+
+// legacy `handle { }` 仍然可用（文档标注为别名）。
+func TestLegacyHandleStillParses(t *testing.T) {
+	f := parseOK(t, "neuron N {\n  input i: Signal<Int>\n  handle {\n    emit i\n  }\n}")
+	nd := f.Decls[0].(*ast.NeuronDecl)
+	if nd.Handler == nil || len(nd.Signals) != 0 {
+		t.Fatalf("handler=%v signals=%d", nd.Handler, len(nd.Signals))
 	}
 }

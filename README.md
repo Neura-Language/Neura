@@ -3,6 +3,9 @@
 `neura` 是 Neura v0.3.7 的参考实现：**Lexer → Parser → Checker → Runtime** 四阶段齐全，
 带虚拟分号、AST dump、错误码注册表、§17 阶段 B 的 span 回填、以及可复现的 MatchTrace。
 
+> **v0.4 增量**：异步事件循环、跨节点 exactly-once、Place Adapter、LogicDB 相似度扩展见文末「附录 A」。以下为 v0.3.7 基线文档，保持原样。
+
+
 ```
 Go 1.21+ / 标准库零依赖 / 7472 行 Go / 178 组测试断言全绿
 ```
@@ -206,3 +209,594 @@ bash scripts/gen_expected.sh && git diff --exit-code testdata/expected_errors.js
 | KNOWN-04：规则 14 废弃 | `checker.Check` 跳过并输出 `rule 14 deprecated, see rule 37` |
 | KNOWN-05：列号从行首含缩进 | `internal/lexer` 用 rune 列计数；`TestColumnBasis` 钉住 `-` 在 col 11 |
 | KNOWN-06：`let x = 1 = 2` 文案 | `internal/parser` `assignLHSMsg` 逐字一致，测试用 `==` 比对 |
+
+
+---
+
+# 附录 A：Neura v0.4 Roadmap 核心实现（事件循环 / exactly-once / Place / 相似度）
+
+> 事件循环 / 轻量跨节点 exactly-once / Place Adapter / LogicDB 相似度扩展
+>
+> 基线：Neura v0.3.7（Lexer/Parser/Checker、LogicDB、JSON-over-TCP RPC、S2S AES-256-GCM、静态节点表 failover）。
+>
+> 纪律：**零第三方依赖、不引入 Paxos/Raft、所有跨节点控制面流量必须走既有 S2S 加密链路、编译器强类型推导不破坏**。
+
+---
+
+## 0. 总览
+
+```text
+                         ┌────────────────────────────┐
+  .neura ──lexer/parser──▶ ast ──checker──▶ 强类型符号表
+                         └────────────┬───────────────┘
+                                      │
+              ┌───────────────────────┼────────────────────────┐
+              ▼                       ▼                        ▼
+   ┌──────────────────┐    ┌────────────────────┐    ┌────────────────────┐
+   │ Event Loop        │    │ Place Adapter      │    │ LogicDB Similarity │
+   │ actor + mailbox   │    │ labels/metrics     │    │ Jaccard / SimHash  │
+   │ bounded backpressure│  │ where compiler     │    │ Embedding probe    │
+   └────────┬─────────┘    └─────────┬──────────┘    └────────────────────┘
+            │                        │
+            ▼                        ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ runtime.Program（LogicDB / match / invoke / emit / learn）│
+   └──────────────────────────┬───────────────────────────────┘
+                              │ 同进程调用
+                              ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ state.Coordinator（Reserve → Commit + 幂等窗口 + 租约）    │
+   └──────────────────────────┬───────────────────────────────┘
+                              │ S2SPeer.Do
+                              ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ cluster.Node：S2S 握手 → HKDF-SHA256 → AES-256-GCM 帧     │
+   │ Op="state.*" → state.Replica.Handle（禁止明文控制面）      │
+   └──────────────────────────────────────────────────────────┘
+```
+
+新增/改动的包：
+
+| 包 | 文件 | 职责 |
+|---|---|---|
+| `internal/event` | `event.go` | 异步 Signal 事件循环、actor mailbox、背压、类型闸门、trace |
+| `internal/state` | `window.go` `store.go` `coordinator.go` `replica.go` `peer.go` | 乐观 CAS、租约预留、幂等窗口、跨节点两阶段预留提交、S2S Peer |
+| `internal/place` | `place.go` `remote.go` | Place Adapter 抽象、where 编译、标签/指标匹配、K8s NodeSource 扩展口 |
+| `internal/runtime` | `similarity.go` `events.go` `placement.go` | 与解释器/LogicDB/Parser 的接线，Embedding 探针 |
+| `internal/cluster` | `protocol.go` `node.go` | 在既有 S2S 帧上增加控制面 `Op/Payload/Blob`，不新增明文通道 |
+
+---
+
+## 1. Event Loop 与异步 Signal 传播
+
+### 1.1 模型：actor + 有界 mailbox + handler 后置下刷
+
+每个 neuron 是一个 actor：**单 goroutine 串行消费 + 固定容量 mailbox**。
+`emit` 在 handler 内**只追加本地 outbox，永不阻塞**；handler 返回后 actor 才把 outbox 扇出到下游 mailbox，背压只发生在这个下刷阶段。
+
+这是为了同时满足两个约束：
+
+1. 下游不能被无限事件压垮 → mailbox 有界 + 可配置背压；
+2. 同步阻塞式 emit 在 feedback loop（A→B→A）里会死锁 → handler 执行期间不占用自身 mailbox 槽位，返回后再阻塞，环上至少有一个空位可以推进；再加超时兜底。
+
+```go
+type Signal struct {
+    TraceID string   // 全程透传
+    Seq     uint64   // 全局逻辑序号，仅用于 trace 排序
+    Hops    uint16   // 跨神经元跳数，用于斩断反馈环
+    From    Endpoint // Neuron.port
+    Port    string   // 目标输入端口
+    Type    string   // 静态类型标签（Signal<T> 的内层 T）
+    Datum   Datum
+}
+
+type Handler func(ctx context.Context, s Signal, tx *Tx) error
+
+type Tx struct { // handler 写侧：只追加，不阻塞
+    loop    *Loop
+    from    string
+    hops    uint16
+    traceID string
+    emits   []Emit
+}
+```
+
+### 1.2 背压三策略
+
+`Config.Policy`：
+
+| 策略 | 行为 | 适用 |
+|---|---|---|
+| `Block`（默认） | 下刷时等待 `EmitTimeout`（默认 50ms），超时丢弃并计数 | 强语义信号、AI Agent 调度 |
+| `DropNewest` | 满即拒绝新事件 | 遥测、心跳、可丢状态 |
+| `DropOldest` | 挤掉队首最旧事件 | sensor 最新值优先 |
+
+`Loop.Stats()` 暴露每个 neuron 的 `Enqueued/Handled/Failed/Dropped/Blocked/Unrouted/Depth/MaxDepth/Capacity`，容量约束可被测试直接断言。
+
+```go
+func (l *Loop) push(dst Endpoint, s Signal) error {
+    a := l.actor(dst.Neuron)
+    switch l.cfg.Policy {
+    case DropNewest:
+        select {
+        case a.in <- s:
+            l.pending.Add(1)
+            return nil
+        default:
+            a.dropped.Add(1)
+            return ErrBackpressure
+        }
+    default: // Block
+        timer := time.NewTimer(l.cfg.EmitTimeout)
+        defer timer.Stop()
+        select {
+        case a.in <- s:
+            l.pending.Add(1)
+            return nil
+        case <-timer.C:
+            a.blocked.Add(1)
+            a.dropped.Add(1)
+            return ErrBackpressure
+        case <-l.done:
+            return ErrClosed
+        }
+    }
+}
+```
+
+### 1.3 强类型：两道闸
+
+- **编译期**：checker 规则 28/29 已保证 synapse 两端端口存在、方向正确、`Signal<T>` 类型兼容；
+- **运行期**：`Loop.Connect` 再次校验端口方向与 `Type` 相等；`Tx.Emit` 与外部 `Emit` 校验 `Datum.TypeName() == Port.Type`。远端注入、手工拼帧、emit 目标未被 checker 覆盖的情况都会在入队前被拒绝，计数在 `Loop.Rejected()`。
+
+runtime 侧用 `signalValue` 保留静态类型，避免 `Int32/Int64` 在运行时被抹平成 `Int`：
+
+```go
+type signalValue struct {
+    Value Value
+    Type  string // 编译期 Signal<T> 的 T
+}
+func (s signalValue) TypeName() string { return s.Type }
+func (s signalValue) Canon() string    { return s.Value.Canon() }
+```
+
+### 1.4 emit 语法接线
+
+parser 现有 AST 没有「emit 目标端口」字段，因此运行时支持两种写法，且都在类型校验后入队：
+
+```neura
+emit out(value)   // 显式目标端口：parser 解析为 CallExpr，runtime 在求值前截获
+emit value        // neuron 只有一个输出端口时，发往该端口
+```
+
+`emit o(v)` 不会被误判为未知函数调用；多输出端口且目标不明确时打 warning，不静默丢事件。
+
+### 1.5 从 AST 构建与投递
+
+```go
+loop, err := prog.BuildEventLoop(event.Config{
+    Capacity:    256,
+    Policy:      event.Block,
+    EmitTimeout: 20 * time.Millisecond,
+    MaxHops:     32,
+    TraceLimit:  4096,
+})
+if err != nil { return err }
+loop.Start()
+defer loop.Close()
+
+// 外部入口：类型由目标输入端口静态决定
+err = prog.Inject(ctx, loop, "RiskControl", "tx", runtime.FloatV(12000), traceID)
+
+// 等待 in-flight（含 outbox 下刷）清空
+err = loop.WaitIdle(ctx)
+```
+
+### 1.6 保证与边界
+
+**保证**
+
+- 每个 neuron 内 FIFO、串行执行，无 neuron 内数据竞争；
+- mailbox 深度 ≤ `Capacity`；`Block` 下生产者等待有上限；
+- `TraceID` 透传，`Seq` 可还原事件先后（跨 neuron 的调度交错不保证确定）；
+- `MaxHops` 斩断反馈环，不会无限自激。
+
+**不保证**
+
+- 跨 neuron 的全局执行顺序（actor 并发本身不确定）；trace 的 `Seq` 能还原逻辑先后。需要严格回放时，生产端串行注入并在每条事件后 `WaitIdle`；
+- `Drop*` 策略下事件不重放（这是背压而非可靠队列；可靠投递由上层 trace/幂等负责）。
+
+---
+
+## 2. Shared-State 与 Cross-node Exactly-once
+
+### 2.1 目标定义（先把话说清楚）
+
+放弃 Paxos/Raft，提供：
+
+> **每键状态效果 exactly-once + 跨节点最终一致**。
+
+- 网络投递：at-least-once（RPC 超时可能重发）；
+- 状态应用：同一 `TxID` 只应用一次（节点本地幂等窗口）；
+- 多键事务：可检测冲突时 **全有或全无**；提交阶段断链时进入 `Indeterminate`，用同一 `TxID` 重试收敛；
+- **不承诺**分区期间的多键线性一致原子性。需要线性一致多键事务时，另接 Raft，不在本层假装。
+
+### 2.2 三个不变量
+
+1. **单写者**：`Router(key) → owner node`。一个键的写只允许落到 owner，避免多主冲突；
+2. **稳定幂等键**：`TxID = traceID#seq`。跨重试、跨节点、跨进程重启（窗口保留期内）都不变；
+3. **版本 CAS**：`Write.Expect` 是读到的版本；版本不符立即冲突，不覆盖。
+
+### 2.3 两阶段预留提交（不是 2PC 共识，是乐观 2PC）
+
+```text
+Coordinator.Commit(tx)
+  ├─ Phase 1 Reserve(所有 owner)
+  │    Store.Reserve(txID, writes, ttl):
+  │      整体校验 Expect / 租约 → 全部通过才写 pending（节点内原子）
+  │      失败 → Abort 所有已预留节点
+  │
+  └─ Phase 2 Commit(所有 owner)
+       Store.Commit(txID, keys):
+          校验 pending.by == txID → 版本 +1 → 落盘 → 写 txID 幂等窗口
+          同 txID 重入 → 直接返回缓存结果（版本不再 +1）
+```
+
+- 预留租约 `TTL`：协调器崩溃后，未提交的 pending 自动过期，不会永久锁键；
+- `Commit` 在同一把 Store 互斥锁内「先校验全部 key、再统一应用」，节点内不会部分提交；
+- 提交阶段远端失败：返回 `ErrIndeterminate` + 未确认节点列表。**用同一 `TxID` 重试**时，已提交节点命中幂等窗口、未提交节点继续 commit，最终收敛；
+- 反熵：`Store.Merge` 按 `(Version, TxID)` 做确定性 LWW；`Coordinator.Reconcile` 从 owner 拉取并修复本地。
+
+### 2.4 核心结构
+
+```go
+type Write struct {
+    Key    string
+    Value  []byte
+    Expect Version // 0 表示必须不存在
+    Delete bool
+}
+
+type Record struct {
+    Key     string
+    Version Version
+    Value   []byte
+    Deleted bool
+    TraceID string
+    TxID    string
+}
+
+type Store struct {
+    mu      sync.Mutex
+    kv      map[string]*entry   // entry: rec + pending + by + until
+    applied *Window             // txID → *TxnResult，TTL + 容量双限
+}
+
+type Coordinator struct {
+    Self     string
+    Store    *Store
+    Replica  *Replica
+    Peer     Peer               // 生产实现：S2SPeer
+    Route    Router             // key → owner
+    TTL      time.Duration
+    Attempts int
+    applied  *Window            // 协调器侧 singleflight + 结果缓存
+}
+```
+
+`Window` 是进程内 TTL + 容量双限表，支持 singleflight：同 key 并发 `Do` 只执行一次，失败不缓存（允许同 key 重试），成功结果按 TTL/容量淘汰。
+
+### 2.5 冲突重试（推荐用法）
+
+```go
+res, err := coord.CommitFn(ctx, traceID, func(ctx context.Context, attempt int) (*state.Txn, error) {
+    // 每次重建都必须重新读版本；不要复用旧 Expect
+    rec, _ := store.Get("account:42")
+    return &state.Txn{
+        ID:      fmt.Sprintf("%s#%d", traceID, attempt+1), // 稳定且唯一
+        TraceID: traceID,
+        Writes: []state.Write{{
+            Key:    "account:42",
+            Expect: rec.Version,
+            Value:  mustJSON(newBalance),
+        }},
+    }, nil
+})
+```
+
+`CommitFn` 只对 `ErrConflict` 重试（指数退避）；`ErrIndeterminate` 直接返回，由上层用**原 TxID** 重试，或交给修复任务。
+
+### 2.6 网络：只允许 S2S
+
+`cluster.Request` 增加控制面字段（向后兼容）：
+
+```go
+type Request struct {
+    // ... 原有业务字段
+    Op      string `json:"op,omitempty"`      // "state.reserve" / "state.commit" ...
+    Payload []byte `json:"payload,omitempty"`
+}
+
+type Response struct {
+    // ...
+    Blob []byte `json:"blob,omitempty"`
+}
+```
+
+- `Node.SetOpsHandler(rep.Handle)` 安装副本；
+- `executeOps` 在 **未启用 S2S 时直接拒绝**，控制面不存在明文降级；
+- 客户端 `S2SPeer` 无 `RootKey` 返回 `ErrPlaintext`，走 `cluster.CallSecure`：预共享 RootKey 握手 → HKDF-SHA256 会话密钥 → AES-256-GCM 业务帧（复用 v0.3.7 实现，含时间戳/防重放）。
+
+```go
+peer := state.NewS2SPeer(selfAddr, rootKey, 2*time.Second)
+coord := state.NewCoordinator(selfAddr, localStore, peer, state.MapRouter(selfAddr, map[string]string{
+    "account:42": "edge-b:9443",
+}))
+```
+
+### 2.7 边界与运维
+
+| 场景 | 结果 |
+|---|---|
+| 同 TxID 重复 RPC / 超时重试 | 幂等，版本只 +1 |
+| Reserve 冲突 | 立即返回 `ErrConflict`，已预留节点全部 Abort |
+| Commit 阶段断链 | 返回 `ErrIndeterminate`；同 TxID 重试收敛 |
+| 协调器崩溃 | 未提交租约 TTL 到期自动回收 |
+| 节点永久失联 | 需要上层把 owner 迁走并做反熵（`Reconcile` / `Merge`） |
+| 多键跨分区强原子 | **不支持**，这是刻意取舍 |
+
+---
+
+## 3. Place 调度 Adapter
+
+### 3.1 抽象
+
+```go
+type Adapter interface {
+    Name() string
+    Nodes(ctx context.Context) ([]NodeInfo, error)
+    Match(ctx context.Context, req Request) ([]string, error) // 返回 failover 顺序
+}
+
+type Selector interface { // where 的运行时形态
+    Match(n NodeInfo, vars map[string]any, now float64) (bool, error)
+}
+```
+
+默认实现 `LabelAdapter`：节点 `Labels`（字符串）+ `Metrics`（数值）+ `Ready` + 确定性排序。
+`Request` 携带 `At`（显式节点集合，顺序即偏好）、`Vars`（实例字段）、`Balance`、`HashKey`、`Seq`。
+
+### 3.2 where 编译器
+
+`place.Compile(ast.Expr)` 只接受 checker 规则 35 已放行的纯表达式：
+
+- 比较：`== != < <= > >= ~=`（`~=` 为字符串包含）
+- 布尔：`&& || !`（短路）
+- 算术：`+ - * /`（数字）
+- 字面量：int / float / string / bool
+- 标识符：实例字段（`Vars`）> 节点指标 > 节点标签 > `now`
+- `node.<attr>`、`has_label("x")`、`has_metric("x")`
+
+编译结果带 `Deps()` 与 `Unknown(nodes, vars)`，能在调度前定位拼写错误，而不是静默不匹配。
+
+### 3.3 调度流水线
+
+```text
+全部节点
+  → Ready
+  → Labels 精确匹配
+  → At 白名单（非空）
+  → where 求值（纯函数）
+  → balance:
+       ""               名字升序（确定性）
+       round_robin      按 Request.Seq 轮转（不用 wall clock，可复现）
+       consistent_hash  rendezvous（最高随机权重）排序
+  → []string（failover 顺序）
+```
+
+`consistent_hash` 用 rendezvous hashing 而不是虚拟环：无环结构、节点增减只重排冲突键、实现更短。测试覆盖了 200 个键的确定性、最小迁移率与同键复现。
+
+### 3.4 与 runtime 接线
+
+```go
+adapter := place.NewLabelAdapter(
+    place.NodeInfo{Name: "edge-a", Ready: true,
+        Labels:  map[string]string{"zone": "edge"},
+        Metrics: map[string]float64{"gpu_mem": 8}},
+    place.NodeInfo{Name: "edge-b", Ready: true,
+        Metrics: map[string]float64{"gpu_mem": 16}},
+)
+
+prog := runtime.NewProgramWithPlacement(file, adapter)
+
+// 节点上下线后重跑所有 place 约束
+_ = prog.Reschedule(ctx)
+
+for _, p := range prog.SortedPlacements() {
+    fmt.Println(runtime.FormatPlacement(p))
+}
+```
+
+规则：
+
+- `place ... at local` 永远本地，不经过 Adapter；
+- `where` 可引用实例字段（通过 `Vars`）；目标为 logic 时没有具体实例，字段约束需改建为节点指标；
+- Adapter 无匹配 → **回退静态 At 表**并打 warning，不阻断启动；
+- `consistent_hash(field)` 的 `HashKey` 取实例字段规范值；目标为 logic 时返回空，让 Adapter 报错后回退。
+
+### 3.5 K8s 扩展口（不引入 client-go）
+
+```go
+type NodeSource interface {
+    List(ctx context.Context) ([]NodeInfo, error)
+    Watch(ctx context.Context) (<-chan Event, error)
+}
+
+type RemoteAdapter struct {
+    Source NodeSource
+    Base   *LabelAdapter
+}
+```
+
+未来接 K8s：用 SharedInformer 实现 `NodeSource`（List lister、Watch AddEventHandler），`RemoteAdapter.Run(ctx)` 增量维护节点快照，`Match` 不再每次打 apiserver。place 包与主二进制都不依赖 K8s SDK；需要时把 `NodeSource` 实现放到独立包/独立二进制即可。
+
+---
+
+## 4. LogicDB 相似度扩展
+
+### 4.1 接口
+
+```go
+type SimilarityProvider interface {
+    Name() string
+    Score(a, b map[string]Value) float64 // 纯函数、[0,1]
+}
+```
+
+`match` 主路径默认走 `JaccardProvider`（保持 v0.3.7 行为），非默认实现会在 `MatchTrace.Candidate.Provider` 打标，便于回放。
+
+### 4.2 兜底实现
+
+- **Jaccard**：相同字段值数 / 字段并集（现有 `Similarity`）；
+- **SimHash**：字段 token 的 64 位 SimHash，`score = 1 - hamming/64`，对字段顺序不敏感，适合高基数标签/文本。
+
+```go
+prog.SetSimilarityProvider(runtime.SimHashProvider{Bits: 64})
+```
+
+### 4.3 外部 Embedding 探针
+
+```go
+type EmbeddingProbe interface {
+    Embed(ctx context.Context, text string) ([]float32, error)
+}
+
+type VectorIndex interface {
+    Search(ctx context.Context, vec []float32, k int) ([]VectorHit, error)
+    Upsert(ctx context.Context, id string, vec []float32) error
+}
+
+type EmbeddingProvider struct {
+    Probe    EmbeddingProbe
+    Fallback SimilarityProvider // 默认 Jaccard
+    Timeout  time.Duration
+    Index    VectorIndex        // 外部向量检索探针
+}
+```
+
+- `Score`：`CanonicalText(fields)` → embedding → cosine；
+- 向量服务超时/报错/空向量 → **自动回退 Jaccard**，match 不失败；
+- `Search`/`Upsert`：把候选召回下推到外部向量库（HNSW/Milvus/pgvector 皆可），runtime 不绑定 SDK；
+- `LogicDB.Nearest(logic, subject, provider, k)`：纯函数相似度检索，score 降序、实例名升序 tie-break，不写 trace。
+
+```go
+ep := &runtime.EmbeddingProvider{
+    Probe:    myEmbeddingClient,
+    Fallback: runtime.JaccardProvider{},
+    Timeout:  30 * time.Millisecond,
+    Index:    myVectorIndex,
+}
+prog.SetSimilarityProvider(ep)
+
+vec := prog.Embed("some text")            // 探针可用时返回向量，否则保持旧 stub（nil + warning）
+hits, err := ep.Search(ctx, fields, 10)   // 外部向量召回探针
+```
+
+确定性边界：外部 embedding 本身可能非确定；`Provider` 标签会记录在 trace 中，候选 tie-break 仍由实例名保证稳定。需要完全可复现时用 Jaccard/SimHash。
+
+---
+
+## 5. 安全与网络纪律
+
+1. **零第三方**：新增代码只 import 标准库与项目内包；
+2. **控制面 no-plaintext**：
+   - `cluster.Node.executeOps` 在 `S2SEnabled()==false` 时直接拒绝 `Op` 请求；
+   - `state.S2SPeer` 无 RootKey 返回 `ErrPlaintext`，不提供明文 fallback；
+   - 所有状态 RPC 复用 `CallSecure`（RootKey 握手 + HKDF-SHA256 + AES-256-GCM + 防重放）；
+3. **强类型不被绕过**：
+   - 编译器仍是第一道类型闸；
+   - 事件端口与状态写值都在运行时复核类型/结构；跨节点 payload 是显式 `[]byte`，由业务层编码，不污染 `Signal<T>` 推导；
+4. **无重型共识**：状态层只有 CAS + 租约 + 幂等窗口，没有 leader 选举、日志复制、Quorum。
+
+---
+
+## 6. 构建与验证
+
+```bash
+cd /opt/neura
+
+gofmt -l .            # 无输出
+go vet ./...          # 无告警
+go test ./... -count=1 -race
+```
+
+当前结果：
+
+```text
+ok  neura/internal/checker
+ok  neura/internal/cluster
+ok  neura/internal/event
+ok  neura/internal/lexer
+ok  neura/internal/parser
+ok  neura/internal/place
+ok  neura/internal/runtime
+ok  neura/internal/state
+```
+
+关键测试覆盖：
+
+| 子系统 | 测试 |
+|---|---|
+| Event | trace/类型透传、Block 容量不越界、DropNewest、类型拒绝、Hop 限环 |
+| State | CAS、重复 Commit 不重复应用、32 并发同 TxID、冲突全回滚、Indeterminate 重试收敛、S2S 端到端、明文拒绝 |
+| Place | 标签/指标/实例字段、has_label、类型错误、round_robin 复现、rendezvous 最小迁移、At 顺序、watch 增量 |
+| Similarity | provider trace 打标、SimHash、embedding 失败回退、VectorIndex 探针、Nearest、CanonicalText |
+| Runtime | BuildEventLoop、synapse 类型不匹配、Place Adapter 接线、静态回退、SharedState 开关 |
+
+---
+
+## 7. API 速查
+
+```go
+// Event
+loop, err := prog.BuildEventLoop(event.Config{Capacity: 256, Policy: event.Block})
+loop.Start(); defer loop.Close()
+err = prog.Inject(ctx, loop, "Neuron", "inputPort", value, traceID)
+err = loop.WaitIdle(ctx)
+stats := loop.Stats()
+
+// State
+store := state.NewStore(10_000, 10*time.Minute)
+replica := state.NewReplica(store)
+replica.Install(node) // node 必须已 EnableS2S
+peer := state.NewS2SPeer(self, rootKey, 2*time.Second)
+coord := state.NewCoordinator(self, store, peer, router)
+res, err := coord.CommitFn(ctx, traceID, buildTxn)
+
+// Place
+a := place.NewLabelAdapter(nodes...)
+prog := runtime.NewProgramWithPlacement(file, a)
+_ = prog.Reschedule(ctx)
+
+// Similarity
+prog.SetSimilarityProvider(runtime.SimHashProvider{})
+prog.SetSimilarityProvider(&runtime.EmbeddingProvider{Probe: p, Index: idx})
+```
+
+---
+
+## 8. 非目标与下一步
+
+**本版不做**
+
+- 多键跨分区强原子（需要共识；当前明确标注 `Indeterminate`）；
+- 事件持久化 / 重放日志（当前是内存 actor + 背压，不是 Kafka）；
+- 自动 shard 迁移与 owner 选举；
+- K8s SDK 本体（只留 `NodeSource` 接口）。
+
+**下一步（按收益排序）**
+
+1. 把 `TraceID#seq` 接到 runtime 的 `nextReqID`，让 capability RPC 与状态事务共用同一幂等域；
+2. Event Loop 增加 per-neuron 指标导出与死信队列（可选，不影响核心路径）；
+3. `NodeSource` 的 K8s 实现独立成 `cmd/neura-k8s-adapter`，通过 `RemoteAdapter` 回注；
+4. 状态窗口可插拔持久化（WAL / 嵌入式 KV），保持接口不变。

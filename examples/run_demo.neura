@@ -17,7 +17,9 @@ synapse In.o -> Out.i on_failure retry(2) failover failover
 
 neuron Worker {
   input w: Signal<Int>
-  handle {
+  output ok: Signal<Bool>
+  // EBNF：on signal <name>: <Type> from <source> { ... }
+  on signal amount: Float from tx {
     emit w
   }
 }

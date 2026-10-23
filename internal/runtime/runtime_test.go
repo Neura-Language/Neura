@@ -24,6 +24,29 @@ func subj(logic string, fields map[string]Value) Value {
 	return InstV(&Instance{Name: "<subject>", Logic: logic, Fields: fields})
 }
 
+// normalizeTraceIDs 去掉 trace_id 字段，便于比较「同一输入的可复现性」。
+func normalizeTraceIDs(t *testing.T, jsonl string) string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(jsonl), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec TraceRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("bad trace line: %v (%s)", err, line)
+		}
+		rec.TraceID = "" // 每次运行唯一
+		rec.Node = ""    // 每个 Program 的节点标识唯一
+		b, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, string(b))
+	}
+	return strings.Join(out, "\n")
+}
+
 func mustRun(t *testing.T, p *Program, entry string, args []Value) Result {
 	t.Helper()
 	res, err := p.Run(entry, args)
@@ -155,10 +178,12 @@ fn pick(x: L) -> Unit {
 		if err := p.WriteTrace(&buf); err != nil {
 			t.Fatal(err)
 		}
+		// trace_id 每次运行必然唯一（用于跨节点串联），确定性只比对其余字段
+		got := normalizeTraceIDs(t, buf.String())
 		if first == "" {
-			first = buf.String()
-		} else if first != buf.String() {
-			t.Fatalf("trace not deterministic:\n%s\nvs\n%s", first, buf.String())
+			first = got
+		} else if first != got {
+			t.Fatalf("trace not deterministic:\n%s\nvs\n%s", first, got)
 		}
 	}
 }
@@ -340,7 +365,7 @@ func TestMatchTraceJSONL(t *testing.T) {
 
 // ---------------- place：只实现 local ----------------
 
-func TestPlaceLocalOnlyWithStub(t *testing.T) {
+func TestPlaceLocalAndCluster(t *testing.T) {
 	src := `
 logic L {
   structure: { k: Int }
@@ -353,23 +378,27 @@ place I at ["node-a", "node-b"] balance consistent_hash(k)
 `
 	p := load(t, src)
 	placed := p.Placements()
-	if placed["I"] != "local(stub)" {
-		t.Fatalf("placements = %v", placed)
+	if placed["I"] != "cluster" {
+		t.Fatalf("placements = %v, want cluster", placed)
+	}
+	nodes := p.Table.Nodes("I")
+	if len(nodes) != 2 || nodes[0] != "node-a" || nodes[1] != "node-b" {
+		t.Fatalf("static node table = %v", nodes)
 	}
 	_, err := p.Run("nope", nil)
 	if err == nil {
 		t.Fatal("expected error for missing entry")
 	}
 
-	// stub warning 必须记录
+	// 节点表登记警告必须出现（含 failover 顺序说明）
 	found := false
 	for _, w := range p.warnings {
-		if strings.Contains(w, "stub") && strings.Contains(w, "node-a") {
+		if strings.Contains(w, "cluster") && strings.Contains(w, "node-a") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("missing place stub warning, got %v", p.warnings)
+		t.Fatalf("missing cluster placement warning, got %v", p.warnings)
 	}
 }
 
@@ -407,7 +436,7 @@ func TestUnimplementedFeaturesAreStubs(t *testing.T) {
 	if p.CrossNodeExactlyOnce() {
 		t.Fatal("cross-node exactly_once must stay stubbed (false)")
 	}
-	for _, want := range []string{"embedding", "custom similarity", "delta", "exactly_once"} {
+	for _, want := range []string{"embedding", "custom similarity", "delta", "幂等"} {
 		if !contains(p.warnings, want) {
 			t.Fatalf("missing stub warning for %q, got %v", want, p.warnings)
 		}
@@ -482,8 +511,8 @@ func TestRunDemoFile(t *testing.T) {
 	if !contains(res.Learns, "learn 1") {
 		t.Fatalf("learns = %v", res.Learns)
 	}
-	if !contains(res.Warnings, "stub") {
-		t.Fatalf("place at 非 local 应打 stub warning，got %v", res.Warnings)
+	if !contains(res.Warnings, "cluster") {
+		t.Fatalf("place at 非 local 应登记节点表，got %v", res.Warnings)
 	}
 	if len(res.Trace) != 1 || res.Trace[0].Chosen != "RouterEU" {
 		t.Fatalf("trace = %+v", res.Trace)
@@ -613,5 +642,78 @@ func TestRunDemoSumBetween(t *testing.T) {
 	// 多传实参必须报错，而不是静默得到 16
 	if _, err := p.Run("sum_between", []Value{IntV(5), IntV(10), IntV(7)}); err == nil {
 		t.Fatal("sum_between 只接受 2 个实参，多传必须报错")
+	}
+}
+
+// ---------------- on signal（EBNF）的运行时 ----------------
+
+func TestOnSignalHandlerRuns(t *testing.T) {
+	src := `
+neuron N {
+  input i: Signal<Int>
+  on signal amount: Float from tx {
+    emit amount
+  }
+}
+`
+	// 端口按顺序吃实参：i=7，端口之后的实参给 signal amount=3.5
+	p := load(t, src)
+	res, err := p.RunHandler("N", []Value{IntV(7), FloatV(3.5)})
+	if err != nil {
+		t.Fatalf("run handler: %v", err)
+	}
+	if !contains(res.Outputs, "emit 3.5") {
+		t.Fatalf("outputs = %v, want emit 3.5", res.Outputs)
+	}
+
+	// 只给端口 → signal 取声明类型的零值
+	p2 := load(t, src)
+	res2, err := p2.RunHandler("N", []Value{IntV(7)})
+	if err != nil {
+		t.Fatalf("run handler: %v", err)
+	}
+	if !contains(res2.Outputs, "emit 0") {
+		t.Fatalf("outputs = %v, want emit 0（Float 零值）", res2.Outputs)
+	}
+
+	// 精确选择 signal
+	p3 := load(t, src)
+	res3, err := p3.RunHandler("N.amount", []Value{IntV(7), FloatV(1.5)})
+	if err != nil {
+		t.Fatalf("run handler: %v", err)
+	}
+	if !contains(res3.Outputs, "emit 1.5") {
+		t.Fatalf("outputs = %v", res3.Outputs)
+	}
+
+	// 不存在的 signal 要报错
+	if _, err := p3.RunHandler("N.nope", nil); err == nil {
+		t.Fatal("want error for unknown signal")
+	}
+}
+
+func TestOnSignalSelectionPrefersFirst(t *testing.T) {
+	src := `
+neuron N {
+  on signal a: Int from tx { emit a }
+  on signal b: Int from tx { emit b }
+}
+`
+	p := load(t, src)
+	res, err := p.RunHandler("N", []Value{IntV(9)})
+	if err != nil {
+		t.Fatalf("run handler: %v", err)
+	}
+	if !contains(res.Outputs, "emit 9") {
+		t.Fatalf("outputs = %v", res.Outputs)
+	}
+
+	p2 := load(t, src)
+	res2, err := p2.RunHandler("N.b", []Value{IntV(4)})
+	if err != nil {
+		t.Fatalf("run handler: %v", err)
+	}
+	if !contains(res2.Outputs, "emit 4") {
+		t.Fatalf("outputs = %v", res2.Outputs)
 	}
 }

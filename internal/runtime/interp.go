@@ -9,14 +9,23 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"neura/internal/ast"
+	"neura/internal/cluster"
+	"neura/internal/event"
+	"neura/internal/place"
+	"neura/internal/state"
 )
 
 // Program 是加载后的可执行程序。
@@ -30,15 +39,30 @@ type Program struct {
 
 	placed map[string]string
 
+	// Phase 5：静态节点表 + 远端调度器（nil 表示全本地）。
+	Table   *cluster.Table
+	Cluster *cluster.Dispatcher
+
+	mu       sync.Mutex // 保护 outputs/learns/warnings/trace/seq（节点并发处理请求）
 	outputs  []string
 	learns   []string
 	warnings []string
 	trace    []TraceRecord
 	seq      int
+
+	sim          SimilarityProvider // nil → Jaccard
+	shared       *state.Coordinator // 非 nil 表示跨节点 exactly-once 已启用
+	placeAdapter place.Adapter      // 非 nil 时 place...where 走 Adapter 求解
+	placements   map[string]Placement
+	reqSeq       int64
+	nodeTag      string
+	selfAddr     string
+	localSeq     int
 }
 
-// Result 是一次运行的产物。
+// Result 是一次运行的产物。TraceID 是全局 trace 串联键。
 type Result struct {
+	TraceID  string
 	Returned Value
 	Outputs  []string
 	Learns   []string
@@ -47,14 +71,23 @@ type Result struct {
 }
 
 // NewProgram 收集声明、装载实例、应用 place（含 stub 警告）。
-func NewProgram(f *ast.File) *Program {
+func NewProgram(f *ast.File) *Program { return newProgram(f, nil) }
+
+// NewProgramWithPlacement 在装载阶段就使用 Place Adapter 求解 where 约束。
+func NewProgramWithPlacement(f *ast.File, a place.Adapter) *Program { return newProgram(f, a) }
+
+func newProgram(f *ast.File, adapter place.Adapter) *Program {
 	p := &Program{
-		file:      f,
-		DB:        NewLogicDB(),
-		fns:       map[string]*ast.FnDecl{},
-		logics:    map[string]*ast.LogicDecl{},
-		instances: map[string]*ast.InstanceDecl{},
-		placed:    map[string]string{},
+		file:         f,
+		DB:           NewLogicDB(),
+		fns:          map[string]*ast.FnDecl{},
+		logics:       map[string]*ast.LogicDecl{},
+		instances:    map[string]*ast.InstanceDecl{},
+		placed:       map[string]string{},
+		placements:   map[string]Placement{},
+		Table:        cluster.NewTable(),
+		nodeTag:      fmt.Sprintf("n%d", time.Now().UnixNano()%1e9),
+		placeAdapter: adapter,
 	}
 	for _, d := range f.Decls {
 		switch x := d.(type) {
@@ -89,28 +122,115 @@ func NewProgram(f *ast.File) *Program {
 	return p
 }
 
-// applyPlace：只实现 local；其余打 stub warning（不阻断）。
+// applyPlace：local 直接落本机；其余优先交给 Place Adapter（where 约束），
+// 没有 Adapter 时退回静态节点表（At 列表顺序 = failover 顺序）。
 func (p *Program) applyPlace(pd *ast.PlaceDecl) {
 	if pd.AtSpec != nil && pd.AtSpec.Local {
 		p.placed[pd.Name] = "local"
+		p.placements[pd.Name] = Placement{Target: pd.Name, Adapter: "local"}
+		return
+	}
+	if p.placeAdapter != nil && p.applyAdapter(pd) {
 		return
 	}
 	nodes := "[]"
 	if pd.AtSpec != nil {
 		nodes = "[" + strings.Join(pd.AtSpec.Nodes, ", ") + "]"
 	}
-	p.placed[pd.Name] = "local(stub)"
-	p.warnf("place %s at %s: stub（只实现 local，跨节点部署未实现，按 local 处理）", pd.Name, nodes)
+	p.placed[pd.Name] = "cluster"
+	var chosen []string
+	if pd.AtSpec != nil && len(pd.AtSpec.Nodes) > 0 {
+		p.Table.Set(pd.Name, pd.AtSpec.Nodes)
+		chosen = append([]string(nil), pd.AtSpec.Nodes...)
+	}
+	p.placements[pd.Name] = Placement{Target: pd.Name, Nodes: chosen, Adapter: "static"}
+	p.warnf("place %s at %s: cluster（静态节点表已登记，failover 顺序 = 声明顺序）", pd.Name, nodes)
 }
 
 func (p *Program) warnf(format string, a ...any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.warnings = append(p.warnings, fmt.Sprintf(format, a...))
 }
 
-func (p *Program) addTrace(r TraceRecord) {
+func (p *Program) addOutput(s string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.outputs = append(p.outputs, s)
+}
+
+func (p *Program) addLearn(s string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.learns = append(p.learns, s)
+}
+
+// nextReqID 生成幂等键（同一次远程调用重试时复用同一个 key）。
+func (p *Program) nextReqID(instance, method string) string {
+	n := atomic.AddInt64(&p.reqSeq, 1)
+	return fmt.Sprintf("%s:%s.%s#%d", p.nodeTag, instance, method, n)
+}
+
+// SetNodeAddr 设置本节点在 trace 里的标识（serve 时用实际监听地址）。
+func (p *Program) SetNodeAddr(addr string) {
+	p.selfAddr = addr
+}
+
+// EnableCluster 启用跨节点调度（self 为空表示不认领任何本地放置）。
+func (p *Program) EnableCluster(self string, timeout time.Duration, logf func(string, ...any)) {
+	p.selfAddr = self
+	p.Cluster = &cluster.Dispatcher{Self: self, Timeout: timeout, Table: p.Table, Log: logf}
+}
+
+// EnableClusterS2S 同 EnableCluster，但跨节点调用走 S2S 加密：
+// 线下 Root Key 握手 → HKDF-SHA256 SessionKey → AES-256-GCM 业务帧。
+func (p *Program) EnableClusterS2S(self string, timeout time.Duration, root *cluster.RootKey, logf func(string, ...any)) {
+	p.EnableCluster(self, timeout, logf)
+	if p.Cluster != nil {
+		p.Cluster.RootKey = root
+	}
+}
+
+// interp.addTrace 打上 trace_id / node / depth / local 序号，再进全局序列。
+func (in *interp) addTrace(r TraceRecord) {
+	r.TraceID = in.traceID
+	r.Node = in.p.selfAddr
+	if r.Node == "" {
+		r.Node = in.p.nodeTag
+	}
+	r.Depth = in.depth
+	p := in.p
+	p.mu.Lock()
+	p.localSeq++
+	r.Local = p.localSeq
 	p.seq++
 	r.Seq = p.seq
 	p.trace = append(p.trace, r)
+	p.mu.Unlock()
+}
+
+// appendRemoteTrace 把远端回传的 trace 片段按序并入本地 trace（重排 seq）。
+func (p *Program) appendRemoteTrace(raw []byte) {
+	if len(raw) == 0 {
+		return
+	}
+	var recs []TraceRecord
+	if err := json.Unmarshal(raw, &recs); err != nil {
+		p.warnf("trace 聚合失败: %v", err)
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range recs {
+		p.seq++
+		recs[i].Seq = p.seq
+		p.trace = append(p.trace, recs[i])
+	}
+}
+
+func (p *Program) newTraceID() string {
+	n := atomic.AddInt64(&p.reqSeq, 1)
+	return fmt.Sprintf("%s-t%d", p.nodeTag, n)
 }
 
 // Placements 返回 place 结果（名字 → local / local(stub)）。
@@ -150,19 +270,17 @@ func (p *Program) Run(entry string, args []Value) (res Result, err error) {
 	if !ok {
 		return Result{}, fmt.Errorf("入口函数 %q 不存在；可用: %s", entry, strings.Join(p.FuncNames(), ", "))
 	}
-	in := &interp{p: p, global: newEnv(nil)}
+	in := &interp{p: p, global: newEnv(nil), traceID: p.newTraceID()}
 	ret := in.callFn(fd, args)
-	return Result{
-		Returned: ret,
-		Outputs:  append([]string(nil), p.outputs...),
-		Learns:   append([]string(nil), p.learns...),
-		Warnings: append([]string(nil), p.warnings...),
-		Trace:    append([]TraceRecord(nil), p.trace...),
-	}, nil
+	return p.snapshot(ret, in.traceID), nil
 }
 
-// RunHandler 直接执行 neuron 的 handle 块（Phase 4 没有事件循环，emit 靠它可达）。
-func (p *Program) RunHandler(neuronName string, args []Value) (res Result, err error) {
+// RunHandler 直接执行 neuron 的 handler（Phase 4 没有事件循环，emit 靠它可达）。
+//
+// target 形式：
+//   - "Neuron"           → 有 on signal 时执行第一个 signal handler，否则执行 legacy handle
+//   - "Neuron.amount"    → 精确执行 on signal amount
+func (p *Program) RunHandler(target string, args []Value) (res Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if re, ok := r.(runtimeError); ok {
@@ -172,6 +290,12 @@ func (p *Program) RunHandler(neuronName string, args []Value) (res Result, err e
 			panic(r)
 		}
 	}()
+
+	neuronName, signalName := target, ""
+	if i := strings.IndexByte(target, '.'); i >= 0 {
+		neuronName, signalName = target[:i], target[i+1:]
+	}
+
 	var nd *ast.NeuronDecl
 	for _, d := range p.file.Decls {
 		if n, ok := d.(*ast.NeuronDecl); ok && n.Name == neuronName {
@@ -181,10 +305,33 @@ func (p *Program) RunHandler(neuronName string, args []Value) (res Result, err e
 	if nd == nil {
 		return Result{}, fmt.Errorf("neuron %q 不存在", neuronName)
 	}
-	if nd.Handler == nil {
-		return Result{}, fmt.Errorf("neuron %q 没有 handle 块", neuronName)
+
+	var (
+		body    *ast.Block
+		sigName string
+		sigType ast.Type
+	)
+	switch {
+	case signalName != "":
+		for _, sh := range nd.Signals {
+			if sh.Name == signalName {
+				body, sigName, sigType = sh.Body, sh.Name, sh.Type
+				break
+			}
+		}
+		if body == nil {
+			return Result{}, fmt.Errorf("neuron %q 没有 on signal %q", neuronName, signalName)
+		}
+	case len(nd.Signals) > 0:
+		sh := nd.Signals[0]
+		body, sigName, sigType = sh.Body, sh.Name, sh.Type
+	case nd.Handler != nil:
+		body = nd.Handler
+	default:
+		return Result{}, fmt.Errorf("neuron %q 没有 handler", neuronName)
 	}
-	in := &interp{p: p, global: newEnv(nil)}
+
+	in := &interp{p: p, global: newEnv(nil), traceID: p.newTraceID()}
 	e := newEnv(nil)
 	for i, port := range nd.Ports {
 		if i < len(args) {
@@ -193,14 +340,55 @@ func (p *Program) RunHandler(neuronName string, args []Value) (res Result, err e
 		}
 		e.define(port.Name, in.synthesize(port.Type))
 	}
-	in.execFnBody(nd.Handler, e)
+	if sigName != "" {
+		// signal 值：优先取端口之后的实参，否则按声明类型给零值
+		if len(args) > len(nd.Ports) {
+			e.define(sigName, args[len(nd.Ports)])
+		} else {
+			e.define(sigName, in.zeroOf(sigType))
+		}
+	}
+	in.execFnBody(body, e)
+	return p.snapshot(Unit(), in.traceID), nil
+}
+
+func (p *Program) snapshot(ret Value, traceID string) Result {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return Result{
-		Returned: Unit(),
+		TraceID:  traceID,
+		Returned: ret,
 		Outputs:  append([]string(nil), p.outputs...),
 		Learns:   append([]string(nil), p.learns...),
 		Warnings: append([]string(nil), p.warnings...),
 		Trace:    append([]TraceRecord(nil), p.trace...),
-	}, nil
+	}
+}
+
+// zeroOf 给 signal 形参一个类型正确的零值。
+func (in *interp) zeroOf(t ast.Type) Value {
+	nt, ok := t.(*ast.NamedType)
+	if !ok {
+		return Unit()
+	}
+	switch nt.Name {
+	case "Int", "Int32", "Int64":
+		return IntV(0)
+	case "Float", "F32", "F64":
+		return FloatV(0)
+	case "Bool":
+		return BoolV(false)
+	case "String":
+		return StringV("")
+	case "Size":
+		return sizeValue("0B")
+	case "Duration":
+		return durationValue("0ms")
+	}
+	if _, isLogic := in.p.logics[nt.Name]; isLogic {
+		return InstV(&Instance{Name: "<subject>", Logic: nt.Name, Fields: map[string]Value{}})
+	}
+	return Unit()
 }
 
 // WriteTrace 把 MatchTrace 以 JSONL 写出（字段固定、无时间戳 → 可复现）。
@@ -217,11 +405,26 @@ func (p *Program) WriteTrace(w io.Writer) error {
 // ---- §14 明确不做的功能：统一 stub ----
 
 func (p *Program) Embed(text string) []float64 {
+	if ep, ok := p.sim.(*EmbeddingProvider); ok && ep.Probe != nil {
+		vec, err := ep.embed(context.Background(), text)
+		if err != nil {
+			p.warnf("embedding 探针失败（%v）", err)
+			return nil
+		}
+		out := make([]float64, len(vec))
+		for i, f := range vec {
+			out[i] = float64(f)
+		}
+		return out
+	}
 	p.warnf("stub: embedding 相似度未实现（%q）", text)
 	return nil
 }
 
 func (p *Program) CustomSimilarity(a, b map[string]Value) float64 {
+	if p.sim != nil {
+		return p.sim.Score(a, b)
+	}
 	p.warnf("stub: custom similarity 未实现，回退到纯函数 Similarity")
 	return Similarity(a, b)
 }
@@ -232,7 +435,10 @@ func (p *Program) AutoDelta() bool {
 }
 
 func (p *Program) CrossNodeExactlyOnce() bool {
-	p.warnf("stub: 跨节点 exactly_once 未实现")
+	if p.shared != nil {
+		return true
+	}
+	p.warnf("stub: 跨节点共享幂等未实现（节点本地幂等表已启用，见 cluster.Idempotency）")
 	return false
 }
 
@@ -278,8 +484,15 @@ type breakSignal struct{}
 type continueSignal struct{}
 
 type interp struct {
-	p      *Program
-	global *env
+	p        *Program
+	global   *env
+	noRemote bool   // 节点内部执行时禁止再次远端转发，避免回路
+	traceID  string // 全局 trace 串联键
+	depth    int    // 跨节点调用深度
+
+	// 事件循环绑定：非 nil 时 emit 写入 outbox，由 actor 在 handler 返回后下刷。
+	out      *event.Tx
+	outPorts []*ast.Port
 }
 
 func (in *interp) callFn(fd *ast.FnDecl, args []Value) Value {
@@ -415,8 +628,14 @@ func (in *interp) execStmt(s ast.Stmt, e *env) Value {
 		panic(continueSignal{})
 
 	case *ast.EmitStmt:
+		if v, ok := in.emitExplicit(x, e); ok {
+			return v
+		}
 		v := in.eval(x.X, e)
-		in.p.outputs = append(in.p.outputs, "emit "+v.String())
+		in.p.addOutput("emit " + v.String())
+		if in.out != nil {
+			in.emitDefault(x.X, v)
+		}
 		return v
 
 	case *ast.InvokeStmt:
@@ -424,12 +643,12 @@ func (in *interp) execStmt(s ast.Stmt, e *env) Value {
 
 	case *ast.ReuseStmt:
 		v := in.eval(x.X, e)
-		in.p.outputs = append(in.p.outputs, "reuse "+v.String())
+		in.p.addOutput("reuse " + v.String())
 		return v
 
 	case *ast.LearnStmt:
 		v := in.eval(x.X, e)
-		in.p.learns = append(in.p.learns, "learn "+v.String())
+		in.p.addLearn("learn " + v.String())
 		return Unit() // learn 是日志副作用语句，不产生值
 	}
 	return Unit()
@@ -472,7 +691,7 @@ func (in *interp) evalMatch(m *ast.MatchStmt, e *env) Value {
 	subj := in.eval(m.Subject, e)
 	if subj.Kind != KInstance || subj.Inst == nil {
 		in.p.warnf("match 的 subject 不是 instance 值（%s），跳过", subj.String())
-		in.p.addTrace(TraceRecord{
+		in.addTrace(TraceRecord{
 			Subject: subj.String(),
 			Logic:   "-",
 			Arm:     "-",
@@ -496,15 +715,16 @@ func (in *interp) evalMatch(m *ast.MatchStmt, e *env) Value {
 				Instance: c.Name,
 				Logic:    c.Logic,
 				Strict:   StrictEqual(s.Fields, c.Fields),
-				Score:    Similarity(s.Fields, c.Fields),
+				Score:    in.p.score(s.Fields, c.Fields),
 				Guard:    pass,
+				Provider: in.p.providerTag(),
 			})
 		}
 		sortCandidates(all) // trace 里也保持 strict 优先、分数降序、名字升序
 		rec.Candidates = all
 		if len(all) == 0 {
 			rec.Reason = "no-candidate"
-			in.p.addTrace(rec)
+			in.addTrace(rec)
 			continue
 		}
 
@@ -517,7 +737,7 @@ func (in *interp) evalMatch(m *ast.MatchStmt, e *env) Value {
 		}
 		if len(passing) == 0 {
 			rec.Reason = "guard-rejected"
-			in.p.addTrace(rec)
+			in.addTrace(rec)
 			continue
 		}
 		sortCandidates(passing)
@@ -525,7 +745,7 @@ func (in *interp) evalMatch(m *ast.MatchStmt, e *env) Value {
 		chosen, ok := in.p.DB.Lookup(passing[0].Instance)
 		if !ok {
 			rec.Reason = "no-candidate"
-			in.p.addTrace(rec)
+			in.addTrace(rec)
 			continue
 		}
 		rec.Chosen = chosen.Name
@@ -535,7 +755,7 @@ func (in *interp) evalMatch(m *ast.MatchStmt, e *env) Value {
 			rec.Reason = "similarity"
 		}
 		rec.Bind = arm.Bind
-		in.p.addTrace(rec)
+		in.addTrace(rec)
 
 		ee := newEnv(e)
 		if arm.Bind != "" {
@@ -786,7 +1006,7 @@ func (in *interp) call(n *ast.CallExpr, e *env) Value {
 			if len(args) > 0 {
 				v = args[0]
 			}
-			in.p.learns = append(in.p.learns, "learn "+v.String())
+			in.p.addLearn("learn " + v.String())
 			return Unit()
 		case "is_hazardous":
 			if len(args) == 0 {
@@ -821,8 +1041,151 @@ func (in *interp) call(n *ast.CallExpr, e *env) Value {
 	return Unit()
 }
 
-// callMethod 执行 capability 方法（capability 不在 neuron handler 内，emit 已由 checker 拦）。
+// callMethod：Phase 5 起先看静态节点表，命中远端就 RPC（带 failover），否则本地执行。
 func (in *interp) callMethod(inst *Instance, name string, args []Value) Value {
+	if in.p.Cluster != nil && !in.noRemote && in.p.Table.Has(inst.Name) {
+		wire, err := in.toWireArgs(args)
+		if err == nil {
+			id := in.p.nextReqID(inst.Name, name)
+			resp, node, derr := in.p.Cluster.Dispatch(inst.Name, name, wire, id, in.traceID, in.depth+1)
+			switch {
+			case derr == nil && !resp.Local:
+				in.p.mu.Lock()
+				in.p.outputs = append(in.p.outputs, resp.Outputs...)
+				in.p.learns = append(in.p.learns, resp.Learns...)
+				in.p.outputs = append(in.p.outputs, fmt.Sprintf("rpc %s.%s @%s", inst.Name, name, node))
+				in.p.mu.Unlock()
+				in.p.appendRemoteTrace(resp.Trace)
+				if resp.Deduped {
+					in.p.addOutput("rpc deduped " + id)
+				}
+				return Unit()
+			case derr != nil && !errors.Is(derr, cluster.ErrNoPlacement):
+				panic(runtimeError{fmt.Sprintf("remote %s.%s 失败: %v", inst.Name, name, derr)})
+			}
+		}
+	}
+	return in.callMethodLocal(inst, name, args)
+}
+
+// CallCapability 实现 cluster.Executor：节点收到 RPC 后在本机执行 capability。
+// 只捕获本次调用的 outputs/learns，并禁止再次远端转发。
+func (p *Program) CallCapability(instance, method string, args []cluster.Value, traceID string, depth int) (res cluster.ExecResult, err error) {
+	inst, ok := p.DB.Lookup(instance)
+	if !ok {
+		return res, fmt.Errorf("instance %q 不存在", instance)
+	}
+	vals := make([]Value, len(args))
+	for i, a := range args {
+		v, verr := p.fromWire(a)
+		if verr != nil {
+			return res, verr
+		}
+		vals[i] = v
+	}
+
+	p.mu.Lock()
+	outMark, learnMark, traceMark := len(p.outputs), len(p.learns), len(p.trace)
+	p.mu.Unlock()
+
+	if traceID == "" {
+		traceID = p.newTraceID() // 调用方没带 trace 时自己起一条
+	}
+	in := &interp{p: p, global: newEnv(nil), noRemote: true, traceID: traceID, depth: depth}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if re, ok := r.(runtimeError); ok {
+					err = re
+					return
+				}
+				panic(r)
+			}
+		}()
+		in.callMethodLocal(inst, method, vals)
+	}()
+
+	p.mu.Lock()
+	res.Outputs = append([]string(nil), p.outputs[outMark:]...)
+	res.Learns = append([]string(nil), p.learns[learnMark:]...)
+	recs := append([]TraceRecord(nil), p.trace[traceMark:]...)
+	p.mu.Unlock()
+
+	if len(recs) > 0 {
+		raw, merr := json.Marshal(recs)
+		if merr != nil {
+			return res, merr
+		}
+		res.Trace = raw
+	}
+	return res, err
+}
+
+func (in *interp) toWireArgs(args []Value) ([]cluster.Value, error) {
+	out := make([]cluster.Value, len(args))
+	for i, a := range args {
+		w, err := in.toWire(a)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = w
+	}
+	return out, nil
+}
+
+func (in *interp) toWire(v Value) (cluster.Value, error) {
+	switch v.Kind {
+	case KUnit:
+		return cluster.Value{Kind: "unit"}, nil
+	case KInt:
+		return cluster.Value{Kind: "int", I: v.I}, nil
+	case KFloat:
+		return cluster.Value{Kind: "float", F: v.F}, nil
+	case KBool:
+		return cluster.Value{Kind: "bool", B: v.B}, nil
+	case KString:
+		return cluster.Value{Kind: "string", S: v.S}, nil
+	case KSize:
+		return cluster.Value{Kind: "size", F: v.F, S: v.S}, nil
+	case KDuration:
+		return cluster.Value{Kind: "duration", F: v.F, S: v.S}, nil
+	case KInstance:
+		if v.Inst == nil {
+			return cluster.Value{Kind: "unit"}, nil
+		}
+		return cluster.Value{Kind: "instance", S: v.Inst.Name}, nil
+	}
+	return cluster.Value{}, fmt.Errorf("无法序列化的值: %v", v.Kind)
+}
+
+func (p *Program) fromWire(v cluster.Value) (Value, error) {
+	switch v.Kind {
+	case "unit":
+		return Unit(), nil
+	case "int":
+		return IntV(v.I), nil
+	case "float":
+		return FloatV(v.F), nil
+	case "bool":
+		return BoolV(v.B), nil
+	case "string":
+		return StringV(v.S), nil
+	case "size":
+		return Value{Kind: KSize, F: v.F, S: v.S}, nil
+	case "duration":
+		return Value{Kind: KDuration, F: v.F, S: v.S}, nil
+	case "instance":
+		inst, ok := p.DB.Lookup(v.S)
+		if !ok {
+			return Value{}, fmt.Errorf("instance %q 在本地不存在", v.S)
+		}
+		return InstV(inst), nil
+	}
+	return Value{}, fmt.Errorf("未知 wire kind %q", v.Kind)
+}
+
+// callMethodLocal 是 Phase 4 的本地执行路径。
+func (in *interp) callMethodLocal(inst *Instance, name string, args []Value) Value {
 	lg := in.p.logics[inst.Logic]
 	if lg == nil {
 		in.p.warnf("instance %s 的 logic %s 不存在", inst.Name, inst.Logic)
@@ -836,7 +1199,7 @@ func (in *interp) callMethod(inst *Instance, name string, args []Value) Value {
 			panic(runtimeError{fmt.Sprintf("%s.%s 需要 %d 个参数，实际传入 %d 个",
 				inst.Name, name, len(sig.Params), len(args))})
 		}
-		in.p.outputs = append(in.p.outputs, "invoke "+inst.Name+"."+name)
+		in.p.addOutput("invoke " + inst.Name + "." + name)
 		if sig.Body == nil {
 			return Unit()
 		}

@@ -1,0 +1,23 @@
+// SIGHUP 热加载演示：改 version 后 kill -HUP，节点不断连、直接换新 Program。
+//
+// 终端 1: ./neura-bin serve examples/hot_demo.neura --addr 127.0.0.1:7011
+// 终端 2: ./neura-bin rpc --addr 127.0.0.1:7011 --instance C --method run
+//         把 version 改成 2 → kill -HUP <终端1 的 pid> → 再 rpc 一次
+logic Conf {
+  structure: { version: Int }
+  capability: {
+    run() -> Unit {
+      learn(self.version)
+    }
+  }
+}
+
+instance C : Conf { structure: { version: 1 } }
+
+place C at ["127.0.0.1:7011"]
+
+fn dispatch(x: Conf) -> Unit {
+  match x against LogicDB {
+    case Conf(e) => { invoke e.run() }
+  }
+}

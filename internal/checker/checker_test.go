@@ -551,3 +551,37 @@ func TestWhereTargetFields(t *testing.T) {
 		t.Fatalf("user_id 是 SomeLogic 的 structure 字段，应通过，got %v", res.Errors)
 	}
 }
+
+// ---------------- on signal（EBNF）的语义检查 ----------------
+
+func TestEmitInOnSignalAllowed(t *testing.T) {
+	src := `neuron N {
+  input i: Signal<Int>
+  output o: Signal<Bool>
+  on signal amount: Float from tx {
+    emit o
+  }
+}`
+	res := parseCheck(t, src)
+	if len(res.Errors) != 0 {
+		t.Fatalf("on signal 内 emit 合法（规则 37），got %v", res.Errors)
+	}
+}
+
+func TestOnSignalTypeAndNameChecked(t *testing.T) {
+	// 未知类型
+	res := parseCheck(t, "neuron N {\n  on signal x: Nope from tx { }\n}")
+	if !hasCode(res, diag.CodeUnknownType) {
+		t.Fatalf("want E-UNKNOWN-TYPE, got %v", codes(res))
+	}
+
+	// signal 名在 handler 内可见（类型来自声明）
+	src := `neuron N {
+  on signal amount: Float from tx {
+    emit amount
+  }
+}`
+	if res := parseCheck(t, src); len(res.Errors) != 0 {
+		t.Fatalf("signal 名应在 handler 作用域内，got %v", res.Errors)
+	}
+}

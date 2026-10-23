@@ -1,0 +1,27 @@
+// Phase 5 跨节点演示：静态节点表直连 + failover + 幂等表。
+//
+// 终端 1：./neura-bin serve examples/net_demo.neura --addr 127.0.0.1:7001
+// 终端 2：./neura-bin run examples/net_demo.neura --entry dispatch --arg @NodeA --node 127.0.0.1:7002
+//         ./neura-bin run examples/net_demo.neura --entry dispatch --arg @NodeB --node 127.0.0.1:7002
+//         ./neura-bin rpc --addr 127.0.0.1:7001 --instance NodeA --method run --id demo-1
+logic Greeter {
+  structure: { id: Int }
+  capability: {
+    run() -> Unit {
+      learn(1)
+    }
+  }
+}
+
+instance NodeA : Greeter { structure: { id: 1 } }
+instance NodeB : Greeter { structure: { id: 2 } }
+
+// 静态节点表：NodeA 直连 7001；NodeB 先打 7999（故意打不通）再 failover 到 7001。
+place NodeA at ["127.0.0.1:7001"]
+place NodeB at ["127.0.0.1:7999", "127.0.0.1:7001"]
+
+fn dispatch(x: Greeter) -> Unit {
+  match x against LogicDB {
+    case Greeter(e) => { invoke e.run() }
+  }
+}

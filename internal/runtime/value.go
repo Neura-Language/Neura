@@ -76,6 +76,33 @@ func (v Value) Canon() string {
 	return fmt.Sprintf("%d:%s", v.Kind, v.String())
 }
 
+// TypeName 是事件/状态层的强类型标签。它是编译器静态类型的运行时投影：
+// 数值宽度（Int/Int32/Int64）在运行时统一为 Int，需要保留声明类型时用 signalValue 包装。
+func (v Value) TypeName() string {
+	switch v.Kind {
+	case KUnit:
+		return "Unit"
+	case KInt:
+		return "Int"
+	case KFloat:
+		return "Float"
+	case KBool:
+		return "Bool"
+	case KString:
+		return "String"
+	case KSize:
+		return "Size"
+	case KDuration:
+		return "Duration"
+	case KInstance:
+		if v.Inst != nil {
+			return v.Inst.Logic
+		}
+		return "Instance"
+	}
+	return "Unknown"
+}
+
 func (v Value) IsNumeric() bool {
 	switch v.Kind {
 	case KInt, KFloat, KSize, KDuration:

@@ -1,0 +1,29 @@
+// 全局 Trace 串联演示：远端 capability 内部再做一次 match，
+// trace 片段随响应回传，由发起端聚合成一条 trace。
+//
+// 终端 1: ./neura-bin serve examples/trace_demo.neura --addr 127.0.0.1:7001
+// 终端 2: ./neura-bin run examples/trace_demo.neura --entry dispatch --arg @EU \
+//                --node 127.0.0.1:7002 --trace /tmp/trace.jsonl
+logic Router {
+  structure: { region: String }
+  capability: {
+    run() -> Unit {
+      // 这一段在远端节点执行，会产生带同一 trace_id 的远端 trace 记录
+      match self against LogicDB {
+        case Router(r) => reuse r
+      }
+    }
+  }
+}
+
+instance EU : Router { structure: { region: "eu" } }
+instance US : Router { structure: { region: "us" } }
+
+place EU at ["127.0.0.1:7001"]
+place US at ["127.0.0.1:7001"]
+
+fn dispatch(x: Router) -> Unit {
+  match x against LogicDB {
+    case Router(e) => { invoke e.run() }
+  }
+}
